@@ -339,7 +339,7 @@ if __name__ == "__main__":
             device=device, 
             time_horizon=time_horizon, 
             plot_interval=plot_interval)
-    else:
+    else: # sometimes we need to evaluate a lot of models
         model_dir = args.model_dir
         model_paths = []
         device = "cuda"
