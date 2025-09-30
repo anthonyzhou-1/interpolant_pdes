@@ -1,0 +1,125 @@
+model:
+    correlation: 0.8
+    model_name: ddim
+    lr: 5.0e-5
+    latent: True
+    sfno:
+        img_size: [64, 128]
+        in_chans: 81 # 8 surface + 65 multilevel + 2 scalars + 6 grid
+        out_chans: 73 # 8 surface + 65 multilevel
+        big_skip: True
+        pos_embed: False
+        embed_dim: 512
+        num_layers: 12
+        scale_factor: 1
+        normalization_layer: "instance_norm"
+        activation_function: "gelu"
+        encoder_layers: 1
+        use_mlp: True
+    ddpm:
+        noise_steps: 100
+        scale: 400
+        skip_percent: 0
+        beta_start: 1.0e-4
+        beta_end: 0.02
+        schedule: linear
+    ddim:
+        noise_steps: 100
+        scale: 400
+        skip_percent: 0
+        beta_start: 1.0e-4
+        beta_end: 0.02
+        schedule: linear
+        num_ddim_steps: 10
+    tsm:
+        noise_steps: 100
+        scale: 400
+        skip_percent: 0
+        beta_start: 1.0e-4
+        beta_end: 0.02
+        schedule: linear
+        skip_percent: 0.9
+    edm:
+        num_steps: 10
+    flow_matching:
+        num_refinement_steps: 5
+        num_train_steps: 11
+    flow_matching:
+        num_refinement_steps: 5
+        num_train_steps: 11
+    interpolant:
+        num_refinement_steps: 5
+        num_train_steps: 101
+        sigma_coef: 0.5
+        integrator: em
+    dit:
+        in_dim: 64
+        out_dim: 32
+        dim: 1024
+        cond_dim: 1024
+        depth_dropout: 0.0
+        kernel_expansion_ratio: 1.0
+        l_max: 20
+        num_heads: 16
+        num_fa_blocks: 0
+        num_ca_blocks: 6
+        num_sa_blocks: 12
+        num_cond: 2
+        num_constants: 6
+        patch_size: 4
+        proj_bottleneck_dim: 1024
+        scale_by_sigma: true
+    autoencoder:
+        model:
+            model_name: AE
+            lr: 8.0e-5
+            multilevel_dim: 65
+            surface_dim: 8
+            channel_dim: 128
+            kl_weight: 2.0e-07
+            latent_dim: 32
+        training:
+            log_dir: logs/
+            strategy: auto
+        scale_factor: 1.0
+        checkpoint: /path/to/pretrained/autoencoder.ckpt
+        data:
+            pde: climate
+            nlat: 64
+            nlon: 128
+
+data:
+    dataset:
+        train_data_path: /path/to/data/new/PLASIM_train_146096.h5
+        val_data_path: /path/to/data/new/PLASIM_valid_1460.h5
+        train_times_path: /path/to/data/new/PLASIM_train_146096_times.pkl
+        val_times_path: /path/to/data/new/PLASIM_valid_1460_times.pkl
+        boundary_path: /path/to/data/new/boundary_vars.h5
+        
+        training_nsteps: 1 
+        val_nsteps: 40 
+    normalizer:
+        norm_stats_path: /path/to/data/new/norm_stats.npz
+
+    nlat: 64
+    nlon: 128
+    with_poles: False
+    load_into_memory: False
+    normalize: True
+    batch_size: 4
+    num_workers: 4
+    pde: climate
+    ae: False
+
+training:
+    seed: 42
+    devices: 4
+    accelerator: gpu
+    strategy: ddp
+    check_val_every_n_epoch: 1
+    log_every_n_steps: 100
+    max_epochs: 50
+    log_dir: logs/
+    project: stochastic_interpolants
+    wandb_mode: online
+    checkpoint: null

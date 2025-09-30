@@ -1,0 +1,125 @@
+model:
+    correlation: 0.8
+    model_name: ddpm
+    lr: 1.0e-4
+    latent: True
+    fno2d:
+        in_channels: 1
+        out_channels: 1
+        modes1: 16
+        modes2: 16
+        hidden_channels: 64
+        cond_channels: 0
+        cond_dim: 0
+        num_layers: 5
+    unet2d:
+        in_channels: 1
+        out_channels: 1
+        hidden_channels: 64
+        cond_channels: 0
+        cond_dim: 0
+        ch_mults: [1, 2 ,4]
+        norm: True
+        use_scale_shift_norm: False
+    lns:
+        in_dim: 4
+        out_dim: 4
+        dim: 512
+        num_heads: 16
+        num_layers: 16
+        patch_size: [1, 1]
+        input_size: [20, 20]
+        cond_dim: 0
+        scale_by_sigma: False
+    ddpm:
+        noise_steps: 100
+        scale: 400
+        skip_percent: 0
+        beta_start: 1.0e-4
+        beta_end: 0.02
+        schedule: linear
+    ddim:
+        noise_steps: 100
+        scale: 400
+        skip_percent: 0
+        beta_start: 1.0e-4
+        beta_end: 0.02
+        schedule: linear
+        num_ddim_steps: 10
+    tsm:
+        noise_steps: 100
+        scale: 400
+        skip_percent: 0
+        beta_start: 1.0e-4
+        beta_end: 0.02
+        schedule: linear
+        skip_percent: 0.99
+    edm:
+        grid_size: [20, 20] # latent grid size (160x160) downsampled 8 times
+        num_steps: 10
+    flow_matching:
+        num_refinement_steps: 2
+        num_train_steps: 5
+    interpolant:
+        num_refinement_steps: 2
+        num_train_steps: 5
+        sigma_coef: 1.0
+        beta_fn: t
+        integrator: euler
+        antithetic_sampling: True
+    dit:
+        in_dim: 8
+        out_dim: 4
+        dim: 512
+        num_heads: 16
+        num_layers: 12
+        patch_size: [1, 1]
+        input_size: [20, 20]
+        cond_dim: 512
+    autoencoder:
+        model:
+            model_name: AE
+            lr: 1.0e-4
+            encoder:
+                in_channels: 1
+                latent_channels: 4
+                width_list: [64, 128, 256, 256]
+                block_type: ["ResBlock", "ResBlock", "ResBlock", "ResBlock"]
+                depth_list: [3, 3, 3, 3]
+            decoder:
+                in_channels: 1
+                latent_channels: 4
+                width_list: [64, 128, 256, 256]
+                block_type: ["ResBlock", "ResBlock", "ResBlock", "ResBlock"]
+                depth_list: [3, 3, 3, 3]
+        training:
+            log_dir: logs/
+            strategy: auto
+        data:
+            pde: km_flow
+        scale_factor: 1.0
+        checkpoint: /path/to/pretrained/autoencoder.ckpt
+
+data:
+    dataset:
+        train_path: /path/to/data/apebench/KolmFlow_train_1024.h5
+        valid_path: /path/to/data/apebench/KolmFlow_valid_256.h5
+        resolution: [100, 160, 160]
+    normalizer:
+        stat_path: /path/to/data/apebench/KolmFlow_train_norm_stats.pkl
+    pde: km_flow
+    num_workers: 8
+    batch_size: 32
+
+training:
+    seed: 42
+    devices: [0]
+    accelerator: gpu
+    strategy: auto
+    check_val_every_n_epoch: 50
+    log_every_n_steps: 10
+    max_epochs: 1000
+    log_dir: logs/
+    project: stochastic_interpolants
+    wandb_mode: online
+    checkpoint: null 

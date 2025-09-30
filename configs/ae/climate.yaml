@@ -1,0 +1,46 @@
+model:
+    model_name: AE
+    lr: 8.0e-5
+    multilevel_dim: 65
+    surface_dim: 8
+    channel_dim: 128
+    kl_weight: 2.0e-07
+    latent_dim: 32
+    
+data:
+    dataset:
+
+        # local paths
+        train_data_path: /path/to/data/PLASIM_train_146096.h5
+        val_data_path: /path/to/data/PLASIM_valid_1460.h5
+        train_times_path: /path/to/data/PLASIM_train_146096_times.pkl
+        val_times_path: /path/to/data/PLASIM_valid_1460_times.pkl
+        boundary_path: /path/to/data/boundary_vars.h5
+        
+        training_nsteps: 0 # train on a single step
+        val_nsteps: 0 # valid on a single step
+    normalizer:
+        norm_stats_path: /path/to/data/norm_stats.npz
+
+    nlat: 64
+    nlon: 128
+    with_poles: False
+    load_into_memory: False
+    normalize: True
+    ae: True
+    batch_size: 16
+    num_workers: 1
+    pde: climate
+
+training:
+    seed: 42
+    devices: 1
+    accelerator: gpu
+    strategy: auto
+    check_val_every_n_epoch: 1
+    log_every_n_steps: 64
+    max_epochs: 50
+    log_dir: logs/
+    project: stochastic_interpolants
+    wandb_mode: online
+    checkpoint: null
