@@ -1,5 +1,5 @@
 # Reframing Generative Models for Physical Systems using Stochastic Interpolants
-
+Anthony Zhou, Alexander Wikner, Amaury Lancelin, Pedram Hassanzadeh, Amir Barati Farimani
 ## Requirements
 
 To install requirements:
