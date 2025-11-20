@@ -5,7 +5,7 @@ Anthony Zhou, Alexander Wikner, Amaury Lancelin, Pedram Hassanzadeh, Amir Barati
 To install requirements:
 ```setup
 conda create -n "my_env" 
-pip install lightning
+python -m pip install lightning
 pip install wandb h5py einops scikit-learn tqdm scipy matplotlib pandas cftime xarray zarr
 ```
 
