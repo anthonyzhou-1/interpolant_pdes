@@ -7,7 +7,7 @@ To install requirements:
 conda create -n "my_env" 
 pip install torch torchvision
 conda install lightning -c conda-forge
-pip install wandb h5py einops scikit-learn tqdm scipy matplotlib pandas cftime
+pip install wandb h5py einops scikit-learn tqdm scipy matplotlib pandas cftime xarray zarr
 ```
 
 To run Rayleigh-Benard tests ([The Well](https://github.com/PolymathicAI/the_well)):
