@@ -23,6 +23,9 @@ cd weatherbench2 && pip install .
 
 Set the dataset, normalization-stat, and log paths (`/path/to/data/...`) in `configs/`.
 
+## Pretrained Model Checkpoints
+Model checkpoints can be found [on Huggingface](https://huggingface.co/ayz2/interpolant_pdes). 
+
 ## Training
 Autoencoder:
 ```
