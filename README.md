@@ -1,4 +1,4 @@
-# Reframing Generative Models for Physical Systems using Stochastic Interpolants
+# Benchmarking Stochastic Interpolants for Modeling Physical Systems
 Anthony Zhou, Alexander Wikner, Amaury Lancelin, Pedram Hassanzadeh, Amir Barati Farimani [Paper](https://arxiv.org/abs/2509.26282)
 
 ## Requirements
