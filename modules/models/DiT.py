@@ -119,8 +119,8 @@ class DIT(nn.Module):
                                       flatten=False,
                                       ndim=ndim)
 
-        # positional embedding
-        self.pe_embed = RotaryEmbedding(dim=self.dim//self.num_heads)
+        # positional embedding; caching is disabled since the cache does not survive EMA weight swaps
+        self.pe_embed = RotaryEmbedding(dim=self.dim//self.num_heads, cache_if_possible=False)
 
         # scalar embedding
         if self.num_cond > 0:

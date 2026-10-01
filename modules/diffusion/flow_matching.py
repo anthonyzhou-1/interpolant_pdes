@@ -4,8 +4,10 @@ import torch.nn as nn
 class ODEIntegrator:
     def __init__(self,
                  method='euler',  # 'euler' or 'heun' or 'midpoint'
+                 t_scale=1.0,
                  ):
         self.method = method
+        self.t_scale = t_scale
         assert method in ['euler', 'heun', 'midpoint'], 'Method not implemented'
 
     def step_fn(self, x, fn, dt, ts, model_kwargs):
@@ -26,7 +28,7 @@ class ODEIntegrator:
                   stencils, timesteps,
                   **kwargs):
         model_wrapper_fn = lambda y, t, model_kwargs: \
-            model(torch.cat((x, y), dim=-1), t.expand(x.shape[0]).unsqueeze(-1), **model_kwargs)
+            model(torch.cat((x, y), dim=-1), self.t_scale * t.expand(x.shape[0]).unsqueeze(-1), **model_kwargs)
 
         for i_t in range(len(stencils)-1):
             t_current = stencils[i_t] # sigma_t
@@ -47,21 +49,26 @@ class LinearScheduler(nn.Module):
                  num_refinement_steps,  # this corresponds to physical time steps
                  num_train_steps=None,  # number of training steps
                  integrator='euler',  # 'euler' or 'heun' or 'midpoint', worth noting that this only available for flow
+                 continuous_t=True,
+                 t_scale=1000.0,
                  ):
         super(LinearScheduler, self).__init__()
 
-        # for flow matching, the min_noise_std is not used
         self.num_train_timesteps = num_train_steps if num_train_steps is not None else num_refinement_steps + 1
         self.num_refinement_steps = num_refinement_steps
+        # continuous_t=False conditions on a discrete grid index instead of t
+        self.continuous_t = continuous_t
+        # scale t in [0, 1] up for the sinusoidal timestep embedding
+        self.t_scale = t_scale if continuous_t else 1.0
         self.sigmas = torch.linspace(0, 1,
                                      steps=self.num_train_timesteps)
 
-        self.num_refinement_steps = num_refinement_steps
-        self.ode_integrator = ODEIntegrator(method=integrator)
+        self.ode_integrator = ODEIntegrator(method=integrator, t_scale=self.t_scale)
 
         self.training_criterion = nn.MSELoss()
 
         print(f"Using LinearScheduler with {self.num_train_timesteps} training steps and {self.num_refinement_steps} refinement steps.")
+        print(f"continuous_t: {self.continuous_t}, t_scale: {self.t_scale}")
 
     def get_noise(self, size, device):
         return torch.randn(size, device=device)
@@ -73,11 +80,14 @@ class LinearScheduler(nn.Module):
         
         noise = self.get_noise(size=y.shape, device=y.device).to(y.dtype)
 
-        # no need to train on k=0
-        k = torch.randint(1, self.num_train_timesteps, device=x.device, size=(x.shape[0],)).long()
+        # t ~ U(0, 1]; t=0 is the noiseless end of the path
+        if self.continuous_t:
+            t = torch.rand(x.shape[0], device=x.device, dtype=torch.float32) * (1.0 - 1e-5) + 1e-5
+        else:
+            k = torch.randint(1, self.num_train_timesteps, device=x.device, size=(x.shape[0],)).long()
+            t = self.sigmas.to(x.device)[k]
 
-        # retrieve from the scheduler
-        sigma_t = self.sigmas.to(x.device)[k] # noise coeff
+        sigma_t = t # noise coeff
         alpha_t = (1 - sigma_t) # signal coeff
         alpha_t = alpha_t.view(-1, *[1 for _ in range(y.ndim - 1)])
         sigma_t = sigma_t.view(-1, *[1 for _ in range(y.ndim - 1)])
@@ -86,7 +96,8 @@ class LinearScheduler(nn.Module):
 
         # conditional prediction. Concat condition (x) and noised input (y_noised)
         u_in = torch.cat([x, y_noised], dim=-1)  # input both condition and noised prediction, [b nx ny 2d]
-        pred = model(u_in, k.float().view(-1, 1), **kwargs) # pred in shape [b nx ny d]
+        cond_t = self.t_scale * t.float().view(-1, 1) if self.continuous_t else k.float().view(-1, 1)
+        pred = model(u_in, cond_t, **kwargs) # pred in shape [b nx ny d]
         target = noise - y # predict eps - y
         loss = self.training_criterion(pred, target)
         if eval:
@@ -103,12 +114,16 @@ class LinearScheduler(nn.Module):
             x.shape, device=x.device
         ).to(x.dtype)
 
-        timesteps = torch.arange(self.num_train_timesteps - 1, -1, -1, device=x.device).long()
-        # trailing timesteps
-        timesteps = timesteps[::((self.num_train_timesteps - 1) // refinement_steps)]
-        sigmas = self.sigmas.to(x.device)[timesteps]
+        if self.continuous_t:
+            # sigma_t == t, descending from 1 to 0
+            timesteps = torch.linspace(1, 0, refinement_steps + 1, device=x.device)
+            sigmas = timesteps
+        else:
+            timesteps = torch.arange(self.num_train_timesteps - 1, -1, -1, device=x.device).long()
+            # trailing timesteps
+            timesteps = timesteps[::((self.num_train_timesteps - 1) // refinement_steps)]
+            sigmas = self.sigmas.to(x.device)[timesteps]
 
-        # currently does not support noising input
         integrator = self.ode_integrator
         y_noised = integrator.integrate(x, y_noised, model, sigmas, timesteps, **kwargs)
 

@@ -1,7 +1,10 @@
 model:
     correlation: 0.8
     model_name: ddim
-    lr: 5.0e-5
+    lr: 1.0e-4
+    optimizer: muon
+    muon_lr_mult: 10.0          # Muon lr = lr * muon_lr_mult
+    weight_decay: 0.01
     latent: True
     sfno:
         img_size: [64, 128]
@@ -41,17 +44,20 @@ model:
         skip_percent: 0.9
     edm:
         num_steps: 10
+        solver: euler       # euler (NFE = num_steps) or heun (NFE = 2*num_steps - 1)
+        stochastic: False   # False = probability-flow ODE, True = Karras-churn SDE
     flow_matching:
         num_refinement_steps: 5
         num_train_steps: 11
-    flow_matching:
-        num_refinement_steps: 5
-        num_train_steps: 11
+        continuous_t: True
+        t_scale: 1000.0
     interpolant:
         num_refinement_steps: 5
         num_train_steps: 101
         sigma_coef: 0.5
         integrator: em
+        continuous_t: True
+        t_scale: 1000.0
     dit:
         in_dim: 64
         out_dim: 32
@@ -82,7 +88,7 @@ model:
             log_dir: logs/
             strategy: auto
         scale_factor: 1.0
-        checkpoint: /path/to/pretrained/autoencoder.ckpt
+        checkpoint: /path/to/data/data/pde/logs/ClimaAE_AE_cnn_base_ddp_2025-06-04T16-32-00/last.ckpt
         data:
             pde: climate
             nlat: 64
@@ -90,36 +96,47 @@ model:
 
 data:
     dataset:
-        train_data_path: /path/to/data/new/PLASIM_train_146096.h5
-        val_data_path: /path/to/data/new/PLASIM_valid_1460.h5
-        train_times_path: /path/to/data/new/PLASIM_train_146096_times.pkl
-        val_times_path: /path/to/data/new/PLASIM_valid_1460_times.pkl
-        boundary_path: /path/to/data/new/boundary_vars.h5
-        
-        training_nsteps: 1 
-        val_nsteps: 40 
+        train_data_path: /path/to/data/data/pde/plasim/PLASIM_train_146096.h5
+        val_data_path: /path/to/data/data/pde/plasim/PLASIM_valid_1460.h5
+        train_times_path: /path/to/data/data/pde/plasim/PLASIM_train_146096_times.pkl
+        val_times_path: /path/to/data/data/pde/plasim/PLASIM_valid_1460_times.pkl
+        boundary_path: /path/to/data/data/pde/plasim/boundary_vars.h5
+
+        training_nsteps: 1
+        val_nsteps: 40
     normalizer:
-        norm_stats_path: /path/to/data/new/norm_stats.npz
+        norm_stats_path: /path/to/data/data/pde/plasim/norm_stats.npz
 
     nlat: 64
     nlon: 128
     with_poles: False
     load_into_memory: False
     normalize: True
-    batch_size: 4
-    num_workers: 4
+    batch_size: 32
+    num_workers: 16
     pde: climate
     ae: False
+    num_val_batches: 16
+    val_subset_seed: 0      # fixed val subset, independent of training.seed
+    val_batch_size: 8
+    val_num_workers: 2
 
 training:
     seed: 42
-    devices: 4
+    devices: 1
     accelerator: gpu
-    strategy: ddp
-    check_val_every_n_epoch: 1
+    strategy: auto
     log_every_n_steps: 100
-    max_epochs: 50
-    log_dir: logs/
-    project: stochastic_interpolants
+    eval_all: False
+    log_dir: /path/to/data/logs/
+    project: stochastic_interpolants_rev
     wandb_mode: online
     checkpoint: null
+    ema_decay: 0.995            # null or 0 disables EMA
+    max_steps: 100_000             # overrides max_epochs when set
+    val_every_n_steps: 1000
+    save_every_n_train_steps: 1000      # refresh last.ckpt
+    archive_every_n_train_steps: 10_000  # keep a permanent model_step_*.ckpt
+    save_best: False             # keep the best checkpoint by val metric
+    lr_decay_every_n_steps: 1000
+    lr_decay_gamma: 0.99

@@ -1,4 +1,4 @@
-# Default imports
+"""CRPS / SSR vs lead time for a climate model checkpoint."""
 import argparse
 import os 
 import torch 
@@ -6,7 +6,6 @@ from tqdm import tqdm
 import pickle 
 import numpy as np
 
-# Custom imports
 from common.utils import get_yaml
 from common.climate_utils import plot_result_climate, plot_crps, plot_ssr
 from dataset.datamodule import PDEDataModule
@@ -72,18 +71,18 @@ def get_crps_chunk(pred, target, latitude):
 def main(args, model_path, save_path, device='cuda'):
     config=get_yaml(args.config)
     config, modelconfig, trainconfig, dataconfig = process_args(args, config)
-    torch.set_float32_matmul_precision('high') # to use tensor cores if available
+    torch.set_float32_matmul_precision('high')
     seed = config["training"]["seed"]
     seed_everything(seed)
 
     checkpoint_path = model_path
     log_dir = save_path
     config['data']['batch_size'] = 1
-    time_horizon = 120 #40 for 10day, 120 for 30day, 240 for 60day
+    time_horizon = 120  # 6 h steps (30 days)
     config["data"]["dataset"]["val_nsteps"] = time_horizon
     ensemble_size = 32
     plot_interval = 1
-    sample_interval = 12 # evaluate every 3 days, which is 4*3=12 steps
+    sample_interval = 12  # every 3 days
     save_out=False
     num_t = 6
 
@@ -136,8 +135,7 @@ def main(args, model_path, save_path, device='cuda'):
             
             pred = pred.cpu()
             target = target.cpu()
-            # pred in shape b ens t nlat nlon (c+nlevel*c)
-            # target in shape b t nlat nlon (c+nlevel*c)
+            # pred: b ens t nlat nlon (c+nlevel*c); target: b t nlat nlon (c+nlevel*c)
 
             if save_out:
                 with open(os.path.join(log_dir, f"pred_{idx}.pkl"), "wb") as f:
@@ -146,7 +144,6 @@ def main(args, model_path, save_path, device='cuda'):
                     pickle.dump(target.cpu(), f)
 
             for key, channel in idx_dict.items():
-                # shape of crps, ssr is (t,)
                 crps_channel = get_crps_chunk(pred[0, ..., channel], target[0, ..., channel], latitude=latitude)
                 ssr_channel = get_ssr_chunk(pred[0, ..., channel], target[0, ..., channel], latitude=latitude)
                 crps_dict[key].append(crps_channel)
@@ -171,7 +168,6 @@ def main(args, model_path, save_path, device='cuda'):
                             title=key,
                             save_path= os.path.join(log_dir, f"ssr_{key}_{idx}.png"))
         
-    # save the crps_dict and ssr_dict
     for key in crps_dict.keys():
         crps_dict[key] = np.array(crps_dict[key])
         ssr_dict[key] = np.array(ssr_dict[key])
@@ -181,7 +177,6 @@ def main(args, model_path, save_path, device='cuda'):
     with open(os.path.join(log_dir, "ssr_dict.pkl"), "wb") as f:
         pickle.dump(ssr_dict, f)
     
-    # plot the crps_dict and ssr_dict
     for key in crps_dict.keys():
         time_averaged_crps = crps_dict[key].mean(axis=0)
         time_averaged_ssr = ssr_dict[key].mean(axis=0)
@@ -220,10 +215,10 @@ def process_args(args, config):
     return config, modelconfig, trainconfig, dataconfig
     
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train a model')
+    parser = argparse.ArgumentParser(description='CRPS / SSR evaluation')
     parser.add_argument("--config", default=None)
     parser.add_argument('--seed', type=int, default=None, help='Random seed.')
-    parser.add_argument('--devices', nargs='+', help='<Required> Set flag', default=[])
+    parser.add_argument('--devices', nargs='+', default=[])
     parser.add_argument('--model_name', default=None)
     parser.add_argument('--wandb_mode', default=None)
     parser.add_argument('--description', default=None)
@@ -236,18 +231,6 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, default=None, help='Path to the model checkpoint')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
     args = parser.parse_args()
-    
-    #interpolant
-    #model_path = "logs/interpolant_climate__2025-07-30T16-40-19/epoch=51-step=158288.ckpt"
-    #save_path = "logs/interpolant_climate__2025-07-30T16-40-19/epoch=51-step=158288_CRPS"
-
-    #flow matching
-    #model_path = "/home/ayz2/climate_diffusion/logs/ClimaDiT_ldm_base_32_ddp_2025-06-19T16-56-18/model_epoch=47_fixed.ckpt"
-    #save_path = "/home/ayz2/climate_diffusion/logs/ClimaDiT_ldm_base_32_ddp_2025-06-19T16-56-18/CRPS_NEW"
-
-    #edm
-    #model_path = "logs/edm_climate__42_2025-08-31T19-27-37/epoch=39-step=121760.ckpt"
-    #save_path = "logs/edm_climate__42_2025-08-31T19-27-37/epoch=39-step=121760_CRPS"
     
     model_path = args.model_path
     save_path = args.save_path

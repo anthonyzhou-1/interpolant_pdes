@@ -1,5 +1,7 @@
 import torch
+import torch.nn as nn
 import lightning as L
+from common.utils import build_lr_scheduler, build_optimizer
 from common.loss import ScaledLpLoss, KL_Loss, WeightedLoss, latitude_weighted_rmse, VRMSE, sRMSE
 from common.plotting import plot_result_2d
 from modules.layers.distributions import DiagonalGaussianDistribution
@@ -15,6 +17,7 @@ class AutoencoderModule(L.LightningModule):
         super().__init__()
 
         self.config=config
+        self.modelconfig = config['model']
         if config['training']['strategy'] == 'ddp' or config['training']['strategy'] == 'ddp_find_unused_parameters_true':
             self.ddp = True
         else:
@@ -182,40 +185,40 @@ class AutoencoderModule(L.LightningModule):
 
                     plot_result_climate(t2m_pred, # t h w
                                     t2m_target,
-                                    f'{self.log_dir}/val_t2m_{self.current_epoch}.png',
+                                    f'{self.log_dir}/val_t2m_{self.global_step}.png',
                                     num_t=1)
                     plot_result_climate(z500_pred,
                                     z500_target,
-                                    f'{self.log_dir}/val_z500_{self.current_epoch}.png',
+                                    f'{self.log_dir}/val_z500_{self.global_step}.png',
                                     num_t=1)
                     plot_result_climate(pr_6h_pred,
                                     pr_6h_target,
-                                    f'{self.log_dir}/val_pr_6h_{self.current_epoch}.png',
+                                    f'{self.log_dir}/val_pr_6h_{self.global_step}.png',
                                     num_t=1)
                     plot_result_climate(u250_pred,
                                     u250_target,
-                                    f'{self.log_dir}/val_u250_{self.current_epoch}.png',
+                                    f'{self.log_dir}/val_u250_{self.global_step}.png',
                                     num_t=1)
                     plot_result_climate(t850_pred,
                                     t850_target,
-                                    f'{self.log_dir}/val_t850_{self.current_epoch}.png',
+                                    f'{self.log_dir}/val_t850_{self.global_step}.png',
                                     num_t=1)
                     
                     plot_spectrum(t2m_pred,
                                 t2m_target,
-                                f'{self.log_dir}/val_t2m_spectrum_{self.current_epoch}.png')
+                                f'{self.log_dir}/val_t2m_spectrum_{self.global_step}.png')
                     plot_spectrum(z500_pred,
                                     z500_target,
-                                    f'{self.log_dir}/val_z500_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_z500_spectrum_{self.global_step}.png')
                     plot_spectrum(pr_6h_pred,
                                     pr_6h_target,
-                                    f'{self.log_dir}/val_pr_6h_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_pr_6h_spectrum_{self.global_step}.png')
                     plot_spectrum(u250_pred,
                                     u250_target,
-                                    f'{self.log_dir}/val_u250_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_u250_spectrum_{self.global_step}.png')
                     plot_spectrum(t850_pred,
                                     t850_target,
-                                    f'{self.log_dir}/val_t850_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_t850_spectrum_{self.global_step}.png')
 
             # calculate the mean loss, shape b for each key, b l for multilevel keys
             t2m_loss = loss_dict['tas'].mean() # surface temp, mean across batch dim
@@ -259,7 +262,7 @@ class AutoencoderModule(L.LightningModule):
                     plot_result_2d(inputs_denorm.unsqueeze(1), # b t x y 1
                                 reconstructions_denorm.unsqueeze(1), 
                                 n_t=1, 
-                                path=f'{self.log_dir}ep_{self.current_epoch}.png')
+                                path=f'{self.log_dir}step_{self.global_step}.png')
 
             self.log('val/loss', loss, on_step=False, on_epoch=True, sync_dist=self.ddp)
             self.log('val/vrmse', vrmse, on_step=False, on_epoch=True, sync_dist=self.ddp)
@@ -270,12 +273,13 @@ class AutoencoderModule(L.LightningModule):
         return loss 
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(list(self.encoder.parameters())+
-                                    list(self.decoder.parameters()), lr=self.lr)
+        # convolutional AE: build_optimizer falls back to Adam
+        optimizer = build_optimizer(nn.ModuleList([self.encoder, self.decoder]),
+                                    self.lr, self.modelconfig, tag=" AE")
         if self.pde == "km_flow":
             step_size = 10
         else:
             step_size = 1
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.99)
+        scheduler = build_lr_scheduler(optimizer, self.config['training'], step_size, 0.99)
 
         return [optimizer], [scheduler]

@@ -1,6 +1,7 @@
 model:
     model_name: AE
     lr: 1.0e-4
+    optimizer: adam             # Muon is not used for the conv autoencoder
     encoder:
         in_channels: 4
         latent_channels: 4
@@ -14,7 +15,7 @@ model:
         width_list: [64, 128, 256, 512]
         block_type: ["ResBlock", "ResBlock", "ResBlock", "ResBlock"]
         depth_list: [4, 4, 4, 4]
-        cond_dim: 2 
+        cond_dim: 2
 
 data:
     dataset:
@@ -34,7 +35,15 @@ training:
     check_val_every_n_epoch: 1
     log_every_n_steps: 100
     max_epochs: 100
-    log_dir: logs/
-    project: stochastic_interpolants
+    log_dir: /path/to/data/logs/
+    project: stochastic_interpolants_rev
     wandb_mode: online
     checkpoint: null
+    ema_decay: 0.999            # null or 0 disables EMA
+    max_steps: null             # overrides max_epochs when set
+    val_every_n_steps: 5000
+    save_every_n_train_steps: 1000      # refresh last.ckpt
+    archive_every_n_train_steps: 25000  # keep a permanent model_step_*.ckpt
+    save_best: True             # keep the best checkpoint by val metric
+    # lr_decay_every_n_steps: 1000
+    # lr_decay_gamma: 0.99

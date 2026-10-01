@@ -61,7 +61,6 @@ class DiTBlock(nn.Module):
                         three=3,
                         h=self.n_heads)
         qk, v = qkv[:, :, :2], qkv[:, :, 2]
-        # print(qk.shape)
 
         q, k = qk[:, :, 0], qk[:, :, 1]
         # use F.scale dot product attention
@@ -130,6 +129,11 @@ class ClimaDIT(nn.Module):
                                    in_chans=self.dim,
                                    hidden_size=self.dim,
                                    flatten=False)
+
+        # precompute the spherical-harmonic basis at construction so the buffer list is
+        # fixed before the EMA callback copies the model
+        _, lat, lon = self.get_grid(self.grid_x, self.grid_y)
+        self.pe_embed.cache_precomputed_sph_harmonics(lat + math.pi / 2, lon - math.pi)
 
         # scalar embedding
         if self.num_cond > 0:

@@ -12,12 +12,16 @@ class DiffusionScheduler(nn.Module):
                  beta_end=0.02,
                  scale=400,
                  mode="ddpm",
-                 ndim=2):
+                 ndim=2,
+                 train_with_skip=False):
         super(DiffusionScheduler, self).__init__()
 
         self.noise_steps = noise_steps
         self.num_ddim_steps = num_ddim_steps
         self.skip_percent = skip_percent
+        # with train_with_skip=False, skip_percent only truncates sampling, so one checkpoint
+        # serves ddpm, ddim and tsm
+        self.train_with_skip = train_with_skip
         self.scale = scale
         self.mode = mode # ddpm, ddim, tsm
 
@@ -58,7 +62,7 @@ class DiffusionScheduler(nn.Module):
         self.register_buffer('alpha', self._alpha)
         self.register_buffer('alpha_hat', self._alpha_hat)
 
-        print(f"Mode: {self.mode}")
+        print(f"Mode: {self.mode}, skip_percent: {self.skip_percent}, train_with_skip: {self.train_with_skip}")
 
     def prepare_noise_schedule(self):
         """
@@ -80,7 +84,7 @@ class DiffusionScheduler(nn.Module):
         """
         Returns random outputs for diff_time for training only 
         """
-        low = int(self.skip_percent * self.noise_steps)
+        low = int(self.skip_percent * self.noise_steps) if self.train_with_skip else 0
         return torch.randint(low=low, high=self.noise_steps, size=(n,), device=device)
     
     def wide(self, t):
@@ -104,7 +108,7 @@ class DiffusionScheduler(nn.Module):
         skip_t = int(self.skip_percent * self.noise_steps)
 
         # don't train on skipped steps
-        if self.skip_percent > 0:
+        if self.train_with_skip and self.skip_percent > 0:
             indices = torch.nonzero(torch.lt(t, skip_t)).squeeze(-1)                
             t[indices] = skip_t
 
@@ -160,7 +164,8 @@ class DiffusionScheduler(nn.Module):
         if self.mode == "ddpm" or self.mode == "tsm":
             return self.sample_main(initial_cond, model, **kwargs)
         elif self.mode == "ddim":
-            if not hasattr(self, 'ref_arr'):
+            # set_nfe() resets ref_arr to None
+            if getattr(self, 'ref_arr', None) is None:
                 self.setup_ddim_sampling()
             return self.sample_ddim(initial_cond, model, **kwargs)
         else:

@@ -2,6 +2,9 @@ model:
     correlation: 0.8
     model_name: fno2d
     lr: 1.0e-4
+    optimizer: muon
+    muon_lr_mult: 10.0          # Muon lr = lr * muon_lr_mult
+    weight_decay: 0.01
     latent: True
     fno2d:
         in_channels: 4
@@ -12,26 +15,6 @@ model:
         cond_channels: 64
         cond_dim: 2
         num_layers: 5
-    unet2d:
-        in_channels: 4
-        out_channels: 4
-        hidden_channels: 64
-        cond_channels: 64
-        cond_dim: 2
-        ch_mults: [1, 2, 4]
-        norm: True
-        use_scale_shift_norm: False
-    lns:
-        in_dim: 4
-        out_dim: 4
-        dim: 1024
-        num_heads: 16
-        num_layers: 16
-        patch_size: [2, 2]
-        input_size: [64, 16]
-        cond_dim: 1024
-        num_cond: 2 # rayleigh number, prandtl number
-        scale_by_sigma: False
     ddpm:
         noise_steps: 100
         scale: 400
@@ -39,14 +22,12 @@ model:
         beta_start: 1.0e-4
         beta_end: 0.02
         schedule: linear
-        grid_size: [64, 16] # latent grid size (160x160) downsampled 8 times
     ddim:
         noise_steps: 100
         scale: 400
         beta_start: 1.0e-4
         beta_end: 0.02
         schedule: linear
-        grid_size: [64, 16] # latent grid size (160x160) downsampled 8 times
         num_ddim_steps: 10
     tsm:
         noise_steps: 100
@@ -54,19 +35,23 @@ model:
         beta_start: 1.0e-4
         beta_end: 0.02
         schedule: linear
-        grid_size: [64, 16] # latent grid size (160x160) downsampled 8 times
         skip_percent: 0.9
     edm:
-        grid_size: [64, 16] # latent grid size (160x160) downsampled 8 times
         num_steps: 10
+        solver: euler       # euler (NFE = num_steps) or heun (NFE = 2*num_steps - 1)
+        stochastic: False   # False = probability-flow ODE, True = Karras-churn SDE
     flow_matching:
         num_refinement_steps: 10
         num_train_steps: 11
+        continuous_t: True
+        t_scale: 1000.0
     interpolant:
         num_refinement_steps: 10
         num_train_steps: 11
-        sigma_coef: 0.25
+        sigma_coef: 0.5
         integrator: euler
+        continuous_t: True
+        t_scale: 1000.0
     dit:
         in_dim: 8
         out_dim: 4
@@ -94,34 +79,48 @@ model:
                 width_list: [64, 128, 256, 512] # 8x downsample
                 block_type: ["ResBlock", "ResBlock", "ResBlock", "ResBlock"]
                 depth_list: [4, 4, 4, 4]
-                cond_dim: 2 
+                cond_dim: 2
         training:
             log_dir: logs/
             strategy: auto
         data:
             pde: rayleigh_benard
         scale_factor: 1.0
-        checkpoint: /path/to/pretrained/autoencoder.ckpt
+        checkpoint: /path/to/data/data/pde/logs/AE__2025-07-10T16-17-36/rbc_ae_64x16/last.ckpt
 
 data:
     dataset:
         base_path: /path/to/data/the_well/
+        dt_stride: 2        # prediction lead time in raw timesteps
     normalizer:
         stat_path: /path/to/data/the_well/datasets/rayleigh_benard/stats.yaml
     pde: rayleigh_benard
-    num_workers: 1
-    batch_size: 8
+    num_workers: 16
+    batch_size: 32
+    prefetch_factor: 4      # batches queued per train worker
+    persistent_workers: True
+    val_batch_size: 8
+    val_num_workers: 2
+    num_val_batches: 4
+    val_subset_seed: 0      # fixed val subset, independent of training.seed
 
 training:
     seed: 42
-    devices: [0]
+    devices: 1
     accelerator: gpu
     strategy: auto
-    check_val_every_n_epoch: 2
     log_every_n_steps: 100
-    max_epochs: 40
-    accumulate_grad_batches: 4
-    log_dir: logs/
-    project: stochastic_interpolants
+    accumulate_grad_batches: 1
+    eval_all: False
+    log_dir: /path/to/data/logs/
+    project: stochastic_interpolants_rev
     wandb_mode: online
     checkpoint: null
+    ema_decay: 0.995            # null or 0 disables EMA
+    max_steps: 100_000
+    val_every_n_steps: 1000
+    save_every_n_train_steps: 1000      # refresh last.ckpt
+    archive_every_n_train_steps: 10_000  # keep a permanent model_step_*.ckpt
+    save_best: True             # keep the best checkpoint by val metric
+    lr_decay_every_n_steps: 1000
+    lr_decay_gamma: 0.99

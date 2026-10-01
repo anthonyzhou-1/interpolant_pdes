@@ -10,8 +10,24 @@ class EDMScheduler():
                  sigma_data=0.5,
                  P_mean=-1.2,
                  P_std=1.2,
-                 ndim=2):
+                 ndim=2,
+                 solver='euler',
+                 stochastic=False,
+                 S_churn=10,
+                 S_tmin=0,
+                 S_tmax=1e6,
+                 S_noise=1):
         
+        # solver: 'euler' (NFE = num_steps) or 'heun' (NFE = 2*num_steps - 1)
+        # stochastic: False = probability-flow ODE, True = Karras churn (SDE)
+        assert solver in ('euler', 'heun'), f"unknown edm solver: {solver}"
+        self.solver = solver
+        self.stochastic = stochastic
+        self.S_churn = S_churn
+        self.S_tmin = S_tmin
+        self.S_tmax = S_tmax
+        self.S_noise = S_noise
+
         self.skip_percent = 0
         self.noise_steps = num_steps
         self.num_steps = num_steps
@@ -74,12 +90,15 @@ class EDMScheduler():
             sigma = sigma * torch.ones([x.shape[0]], device=x.device)
         return self.model_forward_wrapper(x.float(), sigma.float(), model, initial_cond=initial_cond, **kwargs)
 
-    def sample(self, initial_cond, model, edm_solver="euler", edm_stoch=False, **kwargs):
+    def sample(self, initial_cond, model, edm_solver=None, edm_stoch=None, **kwargs):
         """
         Main sample loop for EDMs
         initial_cond: the conditioning input, shape [b nx ny d]
         model: the neural network model
+        edm_solver / edm_stoch: per-call overrides; default to the configured scheme
         """
+        edm_solver = self.solver if edm_solver is None else edm_solver
+        edm_stoch = self.stochastic if edm_stoch is None else edm_stoch
 
         device = initial_cond.device
         
@@ -100,28 +119,21 @@ class EDMScheduler():
             x_next = x_next * t_steps[0]
 
             for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
-                
-                # ============= Start Deterministic sampling =============
                 if not edm_stoch:
                     t_hat = t_cur
                     x_hat = x_next
-                # ============= End Deterministic sampling =============
-                
-
-                # # ============= Start stochastic sampling =============
                 else:
                     noise = torch.randn_like(x_next, device=device)
                     
-                    S_churn = 10
-                    S_tmin = 0
-                    S_tmax = 1e6
-                    S_noise = 1
+                    S_churn = self.S_churn
+                    S_tmin = self.S_tmin
+                    S_tmax = self.S_tmax
+                    S_noise = self.S_noise
 
                     gamma = min(S_churn/self.noise_steps, 2**0.5 -1) if t_cur >= S_tmin and t_cur <= S_tmax else 0
                     noise = noise * S_noise
                     t_hat = t_cur + gamma * t_cur
                     x_hat = x_next + (t_hat**2 - t_cur**2)**0.5 * noise
-                # # ============= End stochastic sampling =============
 
                 # Euler step.
                 denoised = self.edm(x_hat, t_hat, model, initial_cond=initial_cond, **kwargs)

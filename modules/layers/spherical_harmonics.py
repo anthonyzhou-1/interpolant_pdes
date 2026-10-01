@@ -211,18 +211,16 @@ class SphericalHarmonicsPE(torch.nn.Module):
         return Y
 
     def cache_precomputed_sph_harmonics(self, lat, lon, latlon=None):
-        # lat: nlat
-        # lon: nlon
-        # create meshgrid first
-       #  lat, lon = torch.meshgrid([lat, lon], indexing='ij')  # (nlat, nlon)
-
+        # lat: nlat, lon: nlon
         sph_lst = self.sph(lat, lon, latlon)  # lst of (nlat, nlon, 2l+1)
         sph_harmonics = torch.cat(sph_lst, dim=-1)  # (nlat, nlon, (l_max+1)^2)
         self.register_buffer('sph_harmonics', sph_harmonics, persistent=False)
         clear_spherical_harmonics_cache()   # clear cache so that it wont affect other computations
 
     def forward(self, lat, lon, latlon=None):
-        if not hasattr(self, 'sph_harmonics'):
+        # recompute only if the grid changed
+        cached = getattr(self, 'sph_harmonics', None)
+        if cached is None or cached.shape[:2] != (lat.shape[0], lon.shape[0]):
             self.cache_precomputed_sph_harmonics(lat, lon, latlon)
         sph_feat = self.sph_harmonics.detach().clone()  # (nlat, nlon, (l_max+1)^2) or (nface, nside, nside, (l_max+1)^2)
         sph_feat = torch.einsum('ijd,dc->ijc', sph_feat, self.basis_weight)  # (nlat, nlon, dim)

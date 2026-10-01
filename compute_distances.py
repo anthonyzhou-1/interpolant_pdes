@@ -153,7 +153,6 @@ def plot_all(data, pde, save_path):
     mpl.rcParams['ytick.labelsize'] = 12
 
     for ax in axes.flatten():
-        # move spines outward
         ax.spines['bottom'].set_position(('outward', 4))
         ax.spines['left'].set_position(('outward', 4))
         ax.locator_params(nbins=4)
@@ -280,9 +279,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train a model')
+    parser = argparse.ArgumentParser(description='Distances between data and noise distributions')
     parser.add_argument("--config", default=None)
-    parser.add_argument('--devices', nargs='+', help='<Required> Set flag', default=[])
+    parser.add_argument('--devices', nargs='+', default=[])
     parser.add_argument('--model_name', default=None)
     parser.add_argument('--wandb_mode', default=None)
     parser.add_argument('--description', default=None)

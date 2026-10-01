@@ -48,7 +48,6 @@ def pearson_correlation(input: torch.Tensor, target: torch.Tensor, reduce_batch:
     target = target.reshape(B, T, -1)
     input_mean = torch.mean(input, dim=(2), keepdim=True)
     target_mean = torch.mean(target, dim=(2), keepdim=True)
-    # Unbiased since we use unbiased estimates in covariance
     input_std = torch.std(input, dim=(2), unbiased=False)
     target_std = torch.std(target, dim=(2), unbiased=False)
 
@@ -313,7 +312,6 @@ class LatitudeWeightedMSE(nn.Module):
         super().__init__()
         self.loss_module = loss_module
         self.with_poles = with_poles
-        # print(nlat, nlon)
 
         if not with_poles:
             longitude_resolution = nlon
@@ -506,3 +504,84 @@ def VRMSE(pred, target):
     mse = torch.mean(se) # ()
     vrmse = torch.sqrt(mse / (torch.var(u) + 1e-6)) # ()
     return vrmse
+
+#################################################################################
+#                       Ensemble (probabilistic) metrics                        #
+#################################################################################
+# Same estimators as weatherbench2 (CRPS, EnsembleVariance / EnsembleMeanMSE), in torch.
+# Spatial average is a plain mean unless `weight` (see latitude_weight) is given.
+
+
+def latitude_weight(nlat, nlon, with_poles=False):
+    '''Cosine-latitude quadrature weights, normalised to unit mean.'''
+    if not with_poles:
+        # equiangular grid, cell centres offset half a cell from the poles
+        lat_end = (nlat - 1) * (360 / nlon) / 2
+        weights = _weight_for_latitude_vector_without_poles(np.linspace(-lat_end, lat_end, nlat))
+    else:
+        weights = _weight_for_latitude_vector_with_poles(np.linspace(-90, 90, nlat))
+    weights = torch.from_numpy(weights)
+    return weights / weights.mean()
+
+
+def _reduce_dims(target, spatial_dims):
+    # negative indices so the same dims apply to target and to pred (extra ensemble axis)
+    if spatial_dims is not None:
+        return tuple(spatial_dims)
+    return tuple(range(-(target.dim() - 1), 0))   # everything but the batch dim
+
+
+def _weighted_mean(x, dims, weight=None):
+    if weight is not None:
+        x = x * weight
+    return x.mean(dim=dims)
+
+
+def ensemble_crps(pred, target, ens_dim=1, spatial_dims=None, weight=None, return_parts=False):
+    '''
+    Fair (ensemble-size-unbiased) CRPS:  E|X - Y| - 0.5 E|X - X'|.
+
+    args:
+        pred: ensemble forecast, with the members on axis `ens_dim`, e.g. (b, ens, ...)
+        target: ground truth, the same shape as `pred` without `ens_dim`, e.g. (b, ...)
+        ens_dim (int): non-negative axis of `pred` holding the members
+        spatial_dims: negative axes to average over; None averages every axis but the batch
+        weight: broadcastable quadrature weights of unit mean, or None for a plain mean
+        return_parts (bool): also return the skill E|X - Y| and spread E|X - X'| terms
+    returns:
+        CRPS with `spatial_dims` averaged out (so (b,) by default). A single member gives the MAE.
+    '''
+    m = pred.shape[ens_dim]
+    skill = (pred - target.unsqueeze(ens_dim)).abs().mean(dim=ens_dim)
+
+    if m < 2:
+        spread = torch.zeros_like(skill)
+    else:
+        # E|X - X'| = 2/(m(m-1)) * sum_i (2i - m - 1) X_(i) over sorted members (Zamo & Naveau 2018)
+        ordered, _ = pred.sort(dim=ens_dim)
+        shape = [1] * ordered.dim()
+        shape[ens_dim] = m
+        i = torch.arange(1, m + 1, device=pred.device, dtype=ordered.dtype).view(shape)
+        spread = (2.0 / (m * (m - 1))) * ((2 * i - m - 1) * ordered).sum(dim=ens_dim)
+
+    dims = _reduce_dims(target, spatial_dims)
+    crps = _weighted_mean(skill - 0.5 * spread, dims, weight)
+    if return_parts:
+        return crps, _weighted_mean(skill, dims, weight), _weighted_mean(spread, dims, weight)
+    return crps
+
+
+def ensemble_ssr(pred, target, ens_dim=1, spatial_dims=None, weight=None):
+    '''
+    Spread/skill ratio: sqrt(mean ensemble variance) / sqrt(mean ensemble-mean MSE).
+
+    Arguments are as for ensemble_crps. SSR ~ 1 is calibrated; a single member returns 0.
+    '''
+    dims = _reduce_dims(target, spatial_dims)
+    mse = _weighted_mean((pred.mean(dim=ens_dim) - target) ** 2, dims, weight)
+
+    if pred.shape[ens_dim] < 2:
+        return torch.zeros_like(mse)
+
+    variance = _weighted_mean(pred.var(dim=ens_dim, unbiased=True), dims, weight)
+    return variance.sqrt() / mse.sqrt().clamp(min=torch.finfo(mse.dtype).tiny)

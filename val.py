@@ -39,6 +39,10 @@ def process_args(args, config):
         modelconfig['edm']['num_steps'] = args.num_edm_steps
     if args.skip_percent is not None:
         modelconfig['tsm']['skip_percent'] = args.skip_percent
+    if args.dt_stride is not None:
+        dataconfig['dataset']['dt_stride'] = args.dt_stride
+    if args.ensemble is not None:
+        trainconfig["val_ensemble_size"] = args.ensemble
     
     return config, modelconfig, trainconfig, dataconfig
 
@@ -48,7 +52,7 @@ def main(args):
 
     seed = trainconfig["seed"]
     now = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    seed_everything(seed)
+    seed_everything(seed, workers=True)
     torch.set_float32_matmul_precision("high")
     pde = dataconfig['pde']
 
@@ -71,13 +75,21 @@ def main(args):
     else:
         model = TrainModule(config,
                             normalizer=datamodule.normalizer)
+        # Deterministic samplers are rolled out with a single member
+        ens = model.ensemble_size if model.stochastic_sampling else 1
+        model.val_tag = f"E{ens}"
+        if ens != model.ensemble_size:
+            print(f"{modelconfig['model_name']} sampling is deterministic, so its "
+                  f"{model.ensemble_size} members would be identical: using 1. "
+                  f"CRPS is the MAE and the SSR is 0.")
+        print(f"Validating with an ensemble of {ens} member(s)")
 
     trainer = L.Trainer(devices = trainconfig["devices"],
                         accelerator = trainconfig["accelerator"],
                         strategy = trainconfig["strategy"],
-                        check_val_every_n_epoch = trainconfig["check_val_every_n_epoch"],
+                        check_val_every_n_epoch = trainconfig.get("check_val_every_n_epoch", 1),
                         log_every_n_steps = trainconfig["log_every_n_steps"],
-                        max_epochs = trainconfig["max_epochs"],
+                        max_epochs = trainconfig.get("max_epochs", -1),
                         default_root_dir = path,
                         logger=wandb_logger,
                         num_sanity_val_steps=0)
@@ -103,6 +115,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_ddim_steps', type=int, default=None, help='Number of ddim steps')
     parser.add_argument('--num_edm_steps', type=int, default=None, help='Number of edm steps')
     parser.add_argument('--skip_percent', type=float, default=None, help='Skip percent of TSM')
+    parser.add_argument('--dt_stride', type=int, default=None, help='Prediction lead time in raw timesteps (rayleigh_benard only)')
+    parser.add_argument('--ensemble', type=int, default=8,
+                        help='Ensemble members per initial condition (1 for deterministic samplers).')
 
     args = parser.parse_args()
 

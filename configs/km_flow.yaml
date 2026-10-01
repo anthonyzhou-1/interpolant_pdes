@@ -1,7 +1,10 @@
 model:
     correlation: 0.8
-    model_name: ddpm
+    model_name: ddim
     lr: 1.0e-4
+    optimizer: muon
+    muon_lr_mult: 10.0          # Muon lr = lr * muon_lr_mult
+    weight_decay: 0.01
     latent: True
     fno2d:
         in_channels: 1
@@ -12,25 +15,6 @@ model:
         cond_channels: 0
         cond_dim: 0
         num_layers: 5
-    unet2d:
-        in_channels: 1
-        out_channels: 1
-        hidden_channels: 64
-        cond_channels: 0
-        cond_dim: 0
-        ch_mults: [1, 2 ,4]
-        norm: True
-        use_scale_shift_norm: False
-    lns:
-        in_dim: 4
-        out_dim: 4
-        dim: 512
-        num_heads: 16
-        num_layers: 16
-        patch_size: [1, 1]
-        input_size: [20, 20]
-        cond_dim: 0
-        scale_by_sigma: False
     ddpm:
         noise_steps: 100
         scale: 400
@@ -55,11 +39,14 @@ model:
         schedule: linear
         skip_percent: 0.99
     edm:
-        grid_size: [20, 20] # latent grid size (160x160) downsampled 8 times
         num_steps: 10
+        solver: euler       # euler (NFE = num_steps) or heun (NFE = 2*num_steps - 1)
+        stochastic: False   # False = probability-flow ODE, True = Karras-churn SDE
     flow_matching:
         num_refinement_steps: 2
         num_train_steps: 5
+        continuous_t: True
+        t_scale: 1000.0
     interpolant:
         num_refinement_steps: 2
         num_train_steps: 5
@@ -67,6 +54,8 @@ model:
         beta_fn: t
         integrator: euler
         antithetic_sampling: True
+        continuous_t: True
+        t_scale: 1000.0
     dit:
         in_dim: 8
         out_dim: 4
@@ -98,28 +87,38 @@ model:
         data:
             pde: km_flow
         scale_factor: 1.0
-        checkpoint: /path/to/pretrained/autoencoder.ckpt
+        checkpoint: /path/to/data/data/pde/logs/AE__2025-07-10T16-17-36/last.ckpt
 
 data:
     dataset:
-        train_path: /path/to/data/apebench/KolmFlow_train_1024.h5
-        valid_path: /path/to/data/apebench/KolmFlow_valid_256.h5
+        train_path: /path/to/data/data/pde/KmFlow/KolmFlow_train_1024.h5
+        valid_path: /path/to/data/data/pde/KmFlow/KolmFlow_valid_256.h5
         resolution: [100, 160, 160]
+        # dt_stride (lead time in raw timesteps) defaults to 2; override with --dt_stride
     normalizer:
-        stat_path: /path/to/data/apebench/KolmFlow_train_norm_stats.pkl
+        stat_path: /path/to/data/data/pde/KmFlow/KolmFlow_train_norm_stats.pkl
     pde: km_flow
     num_workers: 8
     batch_size: 32
+    num_val_batches: 8
+    val_subset_seed: 0      # fixed val subset, independent of training.seed
 
 training:
     seed: 42
-    devices: [0]
+    devices: 1
     accelerator: gpu
     strategy: auto
-    check_val_every_n_epoch: 50
-    log_every_n_steps: 10
-    max_epochs: 1000
-    log_dir: logs/
-    project: stochastic_interpolants
+    log_every_n_steps: 20
+    eval_all: False
+    log_dir: /path/to/data/logs/
+    project: stochastic_interpolants_rev
     wandb_mode: online
-    checkpoint: null 
+    checkpoint: null
+    ema_decay: 0.99            # null or 0 disables EMA
+    max_steps: 25_000             # overrides max_epochs when set
+    val_every_n_steps: 1000
+    save_every_n_train_steps: 1000      # refresh last.ckpt
+    archive_every_n_train_steps: 5000  # keep a permanent model_step_*.ckpt
+    save_best: True             # keep the best checkpoint by val metric
+    lr_decay_every_n_steps: 250
+    lr_decay_gamma: 0.99

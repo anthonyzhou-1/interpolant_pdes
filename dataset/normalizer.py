@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 
 class WellNormalizer:
-    # small wrapper to implement denormaliztion for z-score normalizer, since it's not in the repo
+    # z-score normalizer with denormalization
     def __init__(self,
                  well_normalizer,):
         self.well_normalizer = well_normalizer

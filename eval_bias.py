@@ -1,4 +1,4 @@
-# Default imports
+"""Long climate rollout from a checkpoint, scored against reference climatological biases."""
 import argparse
 import os 
 import torch 
@@ -6,7 +6,6 @@ import pickle
 from tqdm import tqdm
 import numpy as np
 
-# Custom imports
 from common.utils import get_yaml
 from common.climate_utils import plot_result_climate, plot_loss, plot_spectrum, plot_climatological_bias
 from common.loss import latitude_weighted_rmse
@@ -18,7 +17,7 @@ from lightning.pytorch import seed_everything
 
 
 def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=14612, plot_interval=4000):
-    torch.set_float32_matmul_precision('high') # to use tensor cores if available
+    torch.set_float32_matmul_precision('high')
     config=get_yaml(args.config)
     config, modelconfig, trainconfig, dataconfig = process_args(args, config)
 
@@ -28,9 +27,9 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
     checkpoint_path = model_path
     log_dir = save_path
     config['data']['batch_size'] = 1
-    config["data"]["dataset"]["training_nsteps"] = 1 # only make forecasts one step into the future at a time
+    config["data"]["dataset"]["training_nsteps"] = 1
     config["data"]["dataset"]["val_nsteps"] = 1 
-    ensemble_size = 1 # can sample a batch of noise to make an ensemble prediction in parallel
+    ensemble_size = 1
     verbose = False
 
     os.makedirs(log_dir, exist_ok=True) 
@@ -43,11 +42,7 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     model.load_state_dict(checkpoint['state_dict'])
 
-    loader = datamodule.train_dataloader(shuffle=False) # use trainset since val loader does not have 10 years worth of data
-    #loader = datamodule.val_dataloader()
-    
-    #time_horizon = 14612 #7308 for 5 years, 14612 for 10 years 
-    #plot_interval = 4000 #
+    loader = datamodule.train_dataloader(shuffle=False)  # val split is too short for long rollouts
     surface_var_names = SURFACE_FEATURES 
     multilevel_var_names = MULTI_LEVEL_FEATURES
     
@@ -63,7 +58,7 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
     model.to(device)
     z_pred = None
     i = 0
-    loader.__len__ = lambda: time_horizon # override the length of the loader to be time_horizon
+    loader.__len__ = lambda: time_horizon
 
     with torch.no_grad():
         if os.path.exists(log_dir + "/clim_predictions_final.pkl"):
@@ -75,24 +70,19 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
             for batch in tqdm(loader):
                 batch = [item.to(device) for item in batch]
                 if i == 0:
-                    pass # use true data at the beginning
-                else: # process batch to use predictions from the previous step
-                    # surface feat in shape b 2 nlat nlon c, multilevel feat in shape b 2 nlat nlon nlevel c
+                    pass  # true initial condition
+                else:  # feed back the previous prediction; forcings stay true
                     surface_feat, multi_level_feat, constants, yearly_constants, day_of_year, hour_of_day = batch 
-                    
-                    # first denormalize, since predictions from prior timestep are not normalized
+
                     surface_feat, multi_level_feat = model.normalizer.batch_denormalize(surface_feat, multi_level_feat)
 
-                    # assign first step of features to the last step of the prediction
                     for c, surface_feat_name in enumerate(surface_var_names):
                         surface_feat[:, 0, ... , c] = pred_feat_dict[surface_feat_name][:, -1]
                     for c, multi_level_feat_name in enumerate(multilevel_var_names):
                         multi_level_feat[:, 0, ..., c] = pred_feat_dict[multi_level_feat_name][:, -1]
                     
-                    # normalize all inputs
                     surface_feat, multi_level_feat = model.normalizer.batch_normalize(surface_feat, multi_level_feat)
 
-                    # can use true values for constants, yearly_constants, day_of_year, hour_of_day
                     batch = [surface_feat, multi_level_feat, constants, yearly_constants, day_of_year, hour_of_day]
 
                 loss_dict, pred_feat_dict, target_feat_dict, z_pred = model.validation_step(batch, batch_idx=i, eval=True, z_pred=z_pred, ensemble_size=ensemble_size)
@@ -108,16 +98,15 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
                     clim_pred_dict[k] = clim_pred_dict[k] + pred_feat_dict[k]
                     clim_target_dict[k] = clim_target_dict[k] + target_feat_dict[k]
 
-                for k in clim_pred_dict.keys(): # global mean
+                for k in clim_pred_dict.keys():  # global mean
                     mean_pred_dict[k].append(torch.mean(pred_feat_dict[k]).item())
                     mean_target_dict[k].append(torch.mean(target_feat_dict[k]).item())
 
-                # calculate the mean loss, shape b t for each key, b t l for multilevel keys
-                t2m_loss = loss_dict['tas'].mean(0) # surface temp, mean across batch dim
-                pr_6h_loss = loss_dict['pr_6h'].mean(0) # 6-hour accumulated precipitation
-                z500_loss = loss_dict['zg'][..., 7].mean(0) # geopotential at level=7
-                u250_loss = loss_dict['ua'][..., 4].mean(0) # u wind at level=4
-                t850_loss = loss_dict['ta'][..., 10].mean(0) # temp at level=10
+                t2m_loss = loss_dict['tas'].mean(0)
+                pr_6h_loss = loss_dict['pr_6h'].mean(0)
+                z500_loss = loss_dict['zg'][..., 7].mean(0)
+                u250_loss = loss_dict['ua'][..., 4].mean(0)
+                t850_loss = loss_dict['ta'][..., 10].mean(0)
 
                 t2m_losses.append(t2m_loss[0].item())
                 pr_6h_losses.append(pr_6h_loss[0].item())
@@ -126,15 +115,12 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
                 t850_losses.append(t850_loss[0].item())
 
                 if (i+1) % plot_interval == 0 or i == 0 or i == time_horizon - 1:
-                    # save the predictions
                     pickle.dump(pred_feat_dict, open(log_dir + "/predictions_" + str(i) + ".pkl", "wb"))
-                    # save the targets
                     pickle.dump(target_feat_dict, open(log_dir + "/targets_" + str(i) + ".pkl", "wb"))
 
                     pickle.dump(mean_pred_dict, open(log_dir + "/mean_predictions_" + str(i) + ".pkl", "wb"))
                     pickle.dump(mean_target_dict, open(log_dir + "/mean_targets_" + str(i) + ".pkl", "wb"))
 
-                    # save the climatology
                     pickle.dump(clim_pred_dict, open(log_dir + "/clim_predictions_" + str(i) + ".pkl", "wb"))
                     pickle.dump(clim_target_dict, open(log_dir + "/clim_targets_" + str(i) + ".pkl", "wb"))
 
@@ -200,7 +186,6 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
                                     f'{log_dir}/val_t850_spectrum_{i}.png',
                                     num_t=1)
                     
-                    # plot the loss
                     plot_loss(t2m_losses,
                             f'{log_dir}/t2m_loss.png',
                             key='T2M')
@@ -217,7 +202,6 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
                                 f'{log_dir}/t850_loss.png',
                                 key='T850')
                     
-                    # save the loss
                     pickle.dump(t2m_losses, open(log_dir + "/t2m_loss.pkl", "wb"))
                     pickle.dump(pr_6h_losses, open(log_dir + "/pr_6h_loss.pkl", "wb"))
                     pickle.dump(z500_losses, open(log_dir + "/z500_loss.pkl", "wb"))
@@ -228,7 +212,6 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
                 if i == time_horizon:
                     break
             
-            # save final climatology
             clim_pred_dict = {k: v/time_horizon for k, v in clim_pred_dict.items()}
             clim_target_dict = {k: v/time_horizon for k, v in clim_target_dict.items()}
 
@@ -242,8 +225,8 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
         result_dict = {}
         for f_k, d_k in zip(file_key_list, dict_key_list):
             path = f"{bias_path}/{f_k}_bias.npy"
-            bias = np.load(path) # nlat nlon
-            bias = torch.tensor(bias).unsqueeze(0).unsqueeze(0) # b t nlat nlon
+            bias = np.load(path)  # nlat nlon
+            bias = torch.tensor(bias).unsqueeze(0).unsqueeze(0)  # b t nlat nlon
             
             l = -1 
             if f_k == "zg_50000.0":
@@ -254,7 +237,7 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
                 l = 10
             
             if l == -1:
-                pred_k = pred[d_k].cpu() # b t nlat nlon
+                pred_k = pred[d_k].cpu()
             else:
                 pred_k = pred[d_k][..., l].cpu()
 
@@ -267,7 +250,6 @@ def main(args, model_path, save_path, bias_path, device='cuda', time_horizon=146
             plot_climatological_bias(pred_k[0, 0], bias[0, 0], save_path=f"{log_dir}/{d_k}_bias.png")
         
         print(result_dict)
-        # save the results
         with open(log_dir + "/climatology_results.txt", "w") as f:
             for k, v in result_dict.items():
                 f.write(f"{k}: {v}\n")
@@ -300,10 +282,10 @@ def process_args(args, config):
     return config, modelconfig, trainconfig, dataconfig
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train a model')
+    parser = argparse.ArgumentParser(description='Climatological bias evaluation')
     parser.add_argument("--config", default=None)
     parser.add_argument('--seed', type=int, default=None, help='Random seed.')
-    parser.add_argument('--devices', nargs='+', help='<Required> Set flag', default=[])
+    parser.add_argument('--devices', nargs='+', default=[])
     parser.add_argument('--model_name', default=None)
     parser.add_argument('--model_dir', default=None, help='Directory containing model checkpoints')
     parser.add_argument('--wandb_mode', default=None)
@@ -316,17 +298,14 @@ if __name__ == "__main__":
     parser.add_argument('--mode', type=str, default='single')
     parser.add_argument('--model_path', type=str, default=None)
     parser.add_argument('--save_path', type=str, default=None)
+    parser.add_argument('--bias_path', type=str, default='/path/to/data/bias')
     parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()
 
-    #model_dir = "logs/interpolant_climate__2025-07-30T16-40-19/"
-    #model_dir = "/pscratch/sd/a/ayz2/stochastic_interpolants_logs/edm_climate__42_2025-09-13T20-06-54/"
-    #bias_path = "/home/anthonyz/data/bias"
-    #bias_path = "/pscratch/sd/a/ayz2/PLASIM/data/sim51/bias"
-    bias_path = "/home/ayz2/data/bias"
+    bias_path = args.bias_path
     device = args.device
-    time_horizon = 146095 #7308 for 5 years, 14612 for 10 years, 146095 for 100 years
-    plot_interval = 40000 #
+    time_horizon = 146095  # 6 h steps: 14612 = 10 yr, 146095 = 100 yr
+    plot_interval = 40000
 
     if args.mode == 'single':
         path = args.model_path
@@ -339,7 +318,7 @@ if __name__ == "__main__":
             device=device, 
             time_horizon=time_horizon, 
             plot_interval=plot_interval)
-    else: # sometimes we need to evaluate a lot of models
+    else:  # every checkpoint in --model_dir
         model_dir = args.model_dir
         model_paths = []
         device = "cuda"
@@ -355,16 +334,3 @@ if __name__ == "__main__":
                 device=device, 
                 time_horizon=time_horizon, 
                 plot_interval=plot_interval)
-        
-    # interpolant
-    #model_path = "logs/interpolant_climate__2025-07-30T16-40-19/epoch=51-step=158288.ckpt"
-    #save_path = "logs/interpolant_climate__2025-07-30T16-40-19/epoch=51-step=158288_climatology_10_em"
-
-    # flow matching
-    #model_path = "/home/ayz2/climate_diffusion/logs/ClimaDiT_ldm_base_32_ddp_2025-06-19T16-56-18/model_epoch=47_fixed.ckpt"
-    #save_path = "/home/ayz2/climate_diffusion/logs/ClimaDiT_ldm_base_32_ddp_2025-06-19T16-56-18/fixed_climatology"
-    #bias_path = "/home/ayz2/data/bias"
-    
-    # edm
-    #model_path = "logs/edm_climate__42_2025-08-31T19-27-37/epoch=39-step=121760.ckpt"
-    #save_path = "logs/edm_climate__42_2025-08-31T19-27-37/epoch=39-step=121760_CRPS"

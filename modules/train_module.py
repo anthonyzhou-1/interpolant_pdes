@@ -1,10 +1,12 @@
 import lightning as L
+import time
+import os
 import torch
+import numpy as np
 import pickle 
 from einops import rearrange
 
 from modules.models.FNO2D import FNO2d
-from modules.models.FNO3D import FNO3d
 from modules.models.DiT import DIT
 from modules.models.ClimaDiT import ClimaDIT
 
@@ -13,11 +15,24 @@ from modules.diffusion.flow_matching import LinearScheduler
 from modules.diffusion.edm import EDMScheduler
 from modules.diffusion.interpolant import DriftScheduler
 
+from common.utils import build_lr_scheduler, build_optimizer
 from common.loss import ScaledLpLoss, PearsonCorrelationScore, latitude_weighted_rmse, sRMSE, VRMSE
+from common.loss import ensemble_crps, ensemble_ssr, latitude_weight
 from common.plotting import plot_result_2d, plot_entropy_2d
 from common.climate_utils import plot_result_climate, plot_spectrum
 from common.climate_utils import assemble_scalar_params, assemble_grid_params, assemble_input, disassemble_input
 from dataset.plasim import SURFACE_FEATURES, MULTI_LEVEL_FEATURES
+
+# Climate variables for validation metrics: (log label, feature key, level index or None)
+CLIMATE_TRACKED_VARS = (("t2m", "tas", None),
+                        ("pr_6h", "pr_6h", None),
+                        ("z500", "zg", 7),
+                        ("u250", "ua", 4),
+                        ("t850", "ta", 10))
+
+# lead time in hours -> index into the rollout, at 6 h per step
+CLIMATE_LEAD_TIMES = ((6, 0), (24, 3), (72, 11), (120, 19), (240, 39))
+
 
 class TrainModule(L.LightningModule):
     def __init__(self,
@@ -38,7 +53,9 @@ class TrainModule(L.LightningModule):
         self.log_dir = config['training']['log_dir']
         self.correlation = 0.8
         self.pde = config['data']['pde']
-        self.eval_all = config['training'].get('eval_all', True) # flag to evaluate and plot all validation batches, not just the first one
+        self.eval_all = config['training'].get('eval_all', True) # plot all validation batches, not just the first
+        # plot_val=False disables validation plotting and pickling entirely
+        self.plot_val = config['training'].get('plot_val', True)
         self.normalizer = normalizer
        
         self.criterion = ScaledLpLoss()
@@ -48,31 +65,38 @@ class TrainModule(L.LightningModule):
         self.diffusion = False
         self.latent = self.modelconfig.get("latent", False)
 
+        # sampler wall-clock timing (enabled by eval_nfe.py)
+        self.time_sampling = False
+        self._sample_time_s = 0.0
+        self._sample_calls = 0
+        self._sample_members = 0
+
+        # Validation ensemble size. Deterministic metrics use the member mean; CRPS/SSR use the members.
+        self.ensemble_size = max(1, int(config['training'].get('val_ensemble_size', 1) or 1))
+
+        # Per-timestep metric curves, written to log_dir by on_validation_epoch_end.
+        # val_tag distinguishes validation runs that share a log_dir.
+        self.val_tag = ""
+        self._val_curves = {}
+        self._val_curve_counts = {}
+        self._lat_weight = None
+
+        # number of steps dropped due to non-finite gradients
+        self._nonfinite_steps = 0
+
         if self.model_name == "fno2d":
             fnoconfig = self.modelconfig["fno2d"]
             self.model = FNO2d(**fnoconfig)
             self.latent = False 
-
-        elif self.model_name == "fno3d":
-            fnoconfig = self.modelconfig["fno3d"]
-            self.model = FNO3d(**fnoconfig)
-            self.latent = False 
-
-        elif self.model_name == "lns":
-            ditconfig = self.modelconfig["lns"]
-            if self.pde == "climate":
-                self.model = ClimaDIT(**ditconfig)
-            else:
-                self.model = DIT(**ditconfig)
-            self.latent = True
-        
         elif self.model_name == "sfno":
             assert self.pde == "climate"
             try:
                 from torch_harmonics.examples.models.sfno import SphericalFourierNeuralOperatorNet as SFNO
                 from common.spherical_loss import L2LossS2
-            except:
-                raise ImportError
+            except ImportError as e:
+                raise ImportError(
+                    "sfno needs torch_harmonics >= 0.7.4 built against the installed "
+                    f"torch; importing it failed with: {e}") from e
             
             sfno_config = self.modelconfig["sfno"]
             self.model = SFNO(**sfno_config)
@@ -147,6 +171,143 @@ class TrainModule(L.LightningModule):
         for param in self.autoencoder.parameters():
             param.requires_grad = False
         self.scale_factor = aeconfig.get('scale_factor', 1.0)
+
+    @property
+    def effective_nfe(self):
+        """
+        Number of network evaluations used to generate one frame.
+        """
+        if not self.diffusion:
+            return 1
+        if self.model_name == "ddpm":
+            return int(self.scheduler.noise_steps)
+        if self.model_name == "tsm":
+            return int(round(self.scheduler.noise_steps * (1.0 - self.scheduler.skip_percent)))
+        if self.model_name == "ddim":
+            return int(self.scheduler.num_ddim_steps)
+        if self.model_name == "edm":
+            # heun takes a 2nd-order correction step at every step but the last
+            if getattr(self.scheduler, "solver", "euler") == "heun":
+                return int(2 * self.scheduler.num_steps - 1)
+            return int(self.scheduler.num_steps)
+        if self.model_name in ("flow_matching", "interpolant"):
+            return int(self.scheduler.num_refinement_steps)
+        raise NotImplementedError(f"effective_nfe undefined for {self.model_name}")
+
+    def set_nfe(self, n):
+        """
+        Set the sampling budget for methods whose NFE is a free parameter.
+
+        No-op for ddpm (always runs its full reverse chain) and for deterministic models (NFE 1).
+        Returns the effective NFE after the change, which may differ from n.
+        """
+        if self.diffusion:
+            if self.model_name in ("flow_matching", "interpolant"):
+                self.scheduler.num_refinement_steps = int(n)
+            elif self.model_name == "edm":
+                self.scheduler.num_steps = int(n)
+                self.scheduler.noise_steps = int(n)  # churn strength reads this
+            elif self.model_name == "ddim":
+                self.scheduler.num_ddim_steps = int(n)
+                self.scheduler.ref_arr = None  # force setup_ddim_sampling() to rerun
+            elif self.model_name == "tsm":
+                # stop the reverse chain after n of noise_steps steps
+                steps = self.scheduler.noise_steps
+                self.scheduler.skip_percent = max(0.0, 1.0 - float(n) / steps)
+        return self.effective_nfe
+
+    # models whose sampler has both a deterministic and a stochastic scheme
+    VARIANT_MODELS = ("edm", "interpolant")
+
+    @property
+    def sampler_variant(self):
+        """Label for the sampling scheme, where the model has more than one."""
+        if self.model_name == "edm":
+            return ("sde" if self.scheduler.stochastic else "ode") + f"-{self.scheduler.solver}"
+        if self.model_name == "interpolant":
+            return "sde" if self.scheduler.method == "em" else "ode"
+        return "default"
+
+    @property
+    def sampler_sigma(self):
+        """
+        Noise scale injected by the interpolant sampler (0 for the euler integrator).
+        """
+        if self.model_name != "interpolant":
+            return float("nan")
+        return float(self.scheduler.sigma_sample) if self.scheduler.method == "em" else 0.0
+
+    def set_sampler_variant(self, variant, sigma=None):
+        """
+        Select a sampling scheme: 'ode' (deterministic) or 'sde' (stochastic), optionally
+        suffixed with a solver for edm, e.g. 'sde-heun'. Returns the resulting label.
+
+        edm        : ode = probability-flow ODE, sde = Karras churn.
+        interpolant: ode = euler integrator, sde = Euler-Maruyama at `sigma`
+                     (defaults to the trained sigma_coef).
+        """
+        if variant is None or variant == "default":
+            return self.sampler_variant
+        if self.model_name not in self.VARIANT_MODELS:
+            raise ValueError(f"{self.model_name} has no sampler variants (got {variant!r})")
+        kind, _, solver = variant.partition("-")
+        if kind not in ("ode", "sde"):
+            raise ValueError(f"variant must be ode or sde, got {kind!r}")
+
+        if self.model_name == "edm":
+            self.scheduler.stochastic = (kind == "sde")
+            if solver:
+                assert solver in ("euler", "heun"), f"unknown edm solver: {solver}"
+                self.scheduler.solver = solver
+        else:  # interpolant
+            assert not solver, f"interpolant takes no solver suffix (got {variant!r})"
+            method = "em" if kind == "sde" else "euler"
+            self.scheduler.method = method
+            self.scheduler.integrator.method = method   # Integrator.step_fn reads its own copy
+            if kind == "sde" and sigma is not None:
+                self.scheduler.sigma_sample = float(sigma)
+        return self.sampler_variant
+
+    @property
+    def stochastic_sampling(self):
+        """
+        Whether two samples from the same conditioning differ (interpolant with
+        integrator='euler' is deterministic).
+        """
+        if not self.diffusion:
+            return False
+        if self.model_name == "interpolant":
+            return self.scheduler.method == "em"
+        return True
+
+    def set_ensemble(self, n):
+        """Set the number of ensemble members used by validation_step. Returns the value set."""
+        self.ensemble_size = max(1, int(n))
+        return self.ensemble_size
+
+    def reset_timing(self):
+        self._sample_time_s = 0.0
+        self._sample_calls = 0
+        self._sample_members = 0
+
+    def _timed_forward(self, *args, **kwargs):
+        """forward(), optionally wrapped in a synchronized timer."""
+        if not self.time_sampling:
+            return self.forward(*args, **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = self.forward(*args, **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._sample_time_s += time.perf_counter() - t0
+        self._sample_calls += 1
+        # count members (b * ensemble_size) for per-member timing
+        try:
+            self._sample_members += int(args[0].shape[0])
+        except (IndexError, AttributeError):
+            pass
+        return out
 
     def forward(self, u, cond=None, scalar_params=None, grid_params=None):
         # generative models
@@ -268,14 +429,40 @@ class TrainModule(L.LightningModule):
                 u_pred = self.forward(u_input, cond)
                 loss = self.criterion(u_pred, u_label)
             self.log('train/loss', loss, on_step=True, on_epoch=True, sync_dist=self.ddp)
-        return loss 
+        return loss
+
+    def on_before_optimizer_step(self, optimizer):
+        """Zero the gradients of a batch with non-finite gradients, since a single NaN
+        would otherwise poison the optimizer state for the rest of training."""
+        flags = [torch.isfinite(p.grad).all()
+                 for group in optimizer.param_groups
+                 for p in group["params"] if p.grad is not None]
+        if flags and not bool(torch.stack(flags).all()):
+            self._nonfinite_steps += 1
+            print(f"Non-finite gradient at global step {self.global_step}; dropping this "
+                  f"batch's update ({self._nonfinite_steps} dropped so far).")
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.grad.zero_()
+
+        self.log('train/nonfinite_steps', float(self._nonfinite_steps),
+                 on_step=True, on_epoch=False, sync_dist=self.ddp)
 
     def validation_step(self, batch, batch_idx, eval=False, z_pred=None, ensemble_size=1, return_ens=False):
+
+        # an explicit ensemble_size takes precedence over set_ensemble()
+        if ensemble_size == 1:
+            ensemble_size = self.ensemble_size
+
+        # deterministic samplers would produce identical members
+        if ensemble_size > 1 and not self.stochastic_sampling:
+            ensemble_size = 1
 
         if self.pde == "climate":
             surface_feat, multi_level_feat, constants, yearly_constants, day_of_year, hour_of_day = batch    
         
-            loss_dict, pred_feat_dict, target_feat_dict, z_pred = self.predict_climate(
+            loss_dict, pred_feat_dict, target_feat_dict, z_pred, pred_ens_feat_dict = self.predict_climate(
                                                             surface_feat, 
                                                             multi_level_feat,
                                                             day_of_year,
@@ -291,7 +478,7 @@ class TrainModule(L.LightningModule):
                 return loss_dict, pred_feat_dict, target_feat_dict, z_pred
 
             # visualize the prediction for first batch
-            if batch_idx == 0:
+            if self.plot_val and batch_idx == 0:
                 if self.ddp and self.global_rank != 0:
                     pass
                 else: # not ddp or rank 0
@@ -308,35 +495,35 @@ class TrainModule(L.LightningModule):
 
                     plot_result_climate(t2m_pred, # t h w
                                     t2m_target,
-                                    f'{self.log_dir}/val_t2m_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_t2m_{self.global_step}.png')
                     plot_result_climate(z500_pred,
                                     z500_target,
-                                    f'{self.log_dir}/val_z500_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_z500_{self.global_step}.png')
                     plot_result_climate(pr_6h_pred,
                                     pr_6h_target,
-                                    f'{self.log_dir}/val_pr_6h_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_pr_6h_{self.global_step}.png')
                     plot_result_climate(u250_pred,
                                     u250_target,
-                                    f'{self.log_dir}/val_u250_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_u250_{self.global_step}.png')
                     plot_result_climate(t850_pred,
                                     t850_target,
-                                    f'{self.log_dir}/val_t850_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_t850_{self.global_step}.png')
                     
                     plot_spectrum(t2m_pred,
                                     t2m_target,
-                                    f'{self.log_dir}/val_t2m_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_t2m_spectrum_{self.global_step}.png')
                     plot_spectrum(z500_pred,
                                     z500_target,
-                                    f'{self.log_dir}/val_z500_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_z500_spectrum_{self.global_step}.png')
                     plot_spectrum(pr_6h_pred,
                                     pr_6h_target,
-                                    f'{self.log_dir}/val_pr_6h_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_pr_6h_spectrum_{self.global_step}.png')
                     plot_spectrum(u250_pred,
                                     u250_target,
-                                    f'{self.log_dir}/val_u250_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_u250_spectrum_{self.global_step}.png')
                     plot_spectrum(t850_pred,
                                     t850_target,
-                                    f'{self.log_dir}/val_t850_spectrum_{self.current_epoch}.png')
+                                    f'{self.log_dir}/val_t850_spectrum_{self.global_step}.png')
             
             # calculate the mean loss, shape b t for each key, b t l for multilevel keys
             t2m_loss = loss_dict['tas'].mean(0) # surface temp, mean across batch dim
@@ -375,6 +562,39 @@ class TrainModule(L.LightningModule):
             self.log('val/t850_120', t850_loss[19].item(), on_step=False, on_epoch=True, sync_dist=self.ddp)
             self.log('val/t850_240', t850_loss[39].item(), on_step=False, on_epoch=True, sync_dist=self.ddp)
 
+            # probabilistic metrics (latitude-weighted CRPS and SSR)
+            target_t2m = target_feat_dict['tas']            # b t nlat nlon
+            n_samples, nt_val, nlat, nlon = target_t2m.shape
+            lat_w = self._climate_lat_weight(nlat, nlon, target_t2m)
+            ens = pred_ens_feat_dict['tas'].shape[1]
+
+            for label, key, level in CLIMATE_TRACKED_VARS:
+                pred_ens = pred_ens_feat_dict[key]
+                target_var = target_feat_dict[key]
+                if level is not None:
+                    pred_ens = pred_ens[..., level]
+                    target_var = target_var[..., level]
+                crps_t = ensemble_crps(pred_ens, target_var, spatial_dims=(-2, -1), weight=lat_w).mean(0)
+                ssr_t = ensemble_ssr(pred_ens, target_var, spatial_dims=(-2, -1), weight=lat_w).mean(0)
+
+                self.log(f'val/crps_{label}', crps_t.mean().item(), on_step=False, on_epoch=True, sync_dist=self.ddp)
+                self.log(f'val/ssr_{label}', ssr_t.mean().item(), on_step=False, on_epoch=True, sync_dist=self.ddp)
+                for hours, idx in CLIMATE_LEAD_TIMES:
+                    if idx >= crps_t.numel():
+                        continue
+                    self.log(f'val/crps_{label}_{hours}', crps_t[idx].item(), on_step=False, on_epoch=True, sync_dist=self.ddp)
+                    self.log(f'val/ssr_{label}_{hours}', ssr_t[idx].item(), on_step=False, on_epoch=True, sync_dist=self.ddp)
+
+                self._accumulate_curve(f'crps_{label}', crps_t.tolist(), n_samples, nt_val)
+                self._accumulate_curve(f'ssr_{label}', ssr_t.tolist(), n_samples, nt_val)
+
+            self.log('val/ensemble_size', float(ens), on_step=False, on_epoch=True, sync_dist=self.ddp)
+
+            for label, curve in (('rmse_t2m', t2m_loss), ('rmse_pr_6h', pr_6h_loss),
+                                 ('rmse_z500', z500_loss), ('rmse_u250', u250_loss),
+                                 ('rmse_t850', t850_loss)):
+                self._accumulate_curve(label, curve.tolist(), n_samples, nt_val)
+
         else:
             u_input, u_label, cond = self.get_data(batch, val=True)
 
@@ -388,13 +608,26 @@ class TrainModule(L.LightningModule):
             sRMSE_high = []
             sRMSE_total = []
             accumulated_VRMSE = []
+            accumulated_CRPS = []
+            accumulated_SSR = []
+            # single-member scores (only for ens > 1)
+            accumulated_VRMSE_single = []
+            sRMSE_low_single, sRMSE_mid_single, sRMSE_high_single = [], [], []
             at_correlation = False
 
             if self.latent:
                 u_input = self.encode(u_input, cond) # encode input to latent space
 
+            # roll out E members independently from the same initial condition
+            ens = ensemble_size
+            cond_ens = cond
+            if ens > 1:
+                u_input = u_input.repeat_interleave(ens, dim=0) # (b*ens) ...
+                if cond is not None:
+                    cond_ens = cond.repeat_interleave(ens, dim=0)
+
             for i in range(0, nt-1):
-                pred = self.forward(u_input, cond) # shape (b, nx, ny, 1)
+                pred = self._timed_forward(u_input, cond_ens) # shape (b*ens, nx, ny, 1)
                 u_true = u_label[:, i+1]
 
                 if pred.isnan().any():
@@ -403,11 +636,20 @@ class TrainModule(L.LightningModule):
 
                 true_denorm = self.normalizer.denormalize(u_true)
                 if self.latent:
-                    pred_u = self.decode(pred, cond) # decode prediction from latent space
+                    pred_u = self.decode(pred, cond_ens) # decode prediction from latent space
                 else:
                     pred_u = pred
 
                 pred_denorm = self.normalizer.denormalize(pred_u)
+
+                # b ens ...
+                members = pred_denorm.reshape(-1, ens, *pred_denorm.shape[1:])
+
+                accumulated_CRPS.append(ensemble_crps(members, true_denorm).mean().item())
+                accumulated_SSR.append(ensemble_ssr(members, true_denorm).mean().item())
+
+                # the deterministic metrics are scored on the ensemble mean
+                pred_denorm = members.mean(1)
 
                 u_pred_denorm[:, i+1] = pred_denorm # save prediction
 
@@ -433,8 +675,34 @@ class TrainModule(L.LightningModule):
                 sRMSE_high.append(sRMSE_all[2].item())
                 sRMSE_total.append(sRMSE_all[3].item())
 
-                u_input = pred # update input for next step
-            
+                if ens > 1:
+                    single = members[:, 0]
+                    accumulated_VRMSE_single.append(VRMSE(single, true_denorm).item())
+                    s1 = sRMSE(single, true_denorm, spatial=spatial)
+                    sRMSE_low_single.append(s1[0].item())
+                    sRMSE_mid_single.append(s1[1].item())
+                    sRMSE_high_single.append(s1[2].item())
+
+                u_input = pred # update input for next step (per member, not the mean)
+
+            # rollout diverged on the first step: log metrics as inf
+            if not accumulated_loss:
+                print(f"Rollout produced no usable steps (batch {batch_idx}, global step "
+                      f"{self.global_step}); logging this batch's val metrics as inf.")
+                inf = float('inf')
+                for i in range(10):
+                    self.log(f'val/VRMSE_{i}', inf, on_step=False, on_epoch=True, sync_dist=self.ddp)
+                keys = ['val/loss', 'val/VRMSE', 'val/sRMSE_low', 'val/sRMSE_mid',
+                        'val/sRMSE_high', 'val/sRMSE_total', 'val/CRPS']
+                if ens > 1:
+                    keys += ['val/VRMSE_single', 'val/sRMSE_low_single',
+                             'val/sRMSE_mid_single', 'val/sRMSE_high_single']
+                for key in keys:
+                    self.log(key, inf, on_step=False, on_epoch=True, sync_dist=self.ddp)
+                self.log('val/SSR', 0.0, on_step=False, on_epoch=True, sync_dist=self.ddp)
+                self.log('val/correlation_time', 0.0, on_step=False, on_epoch=True, sync_dist=self.ddp)
+                return
+
             if not at_correlation:
                 correlation_time = nt-1 # didn't go below correlation threshold, therefore the time is the last step
 
@@ -445,7 +713,9 @@ class TrainModule(L.LightningModule):
             for i in range(10):
                 start = i * (len_rollout // 10)
                 end = (i + 1) * (len_rollout // 10)
-                rollout_loss_i = sum(accumulated_VRMSE[start:end]) / 10 
+                if end <= start:
+                    continue
+                rollout_loss_i = sum(accumulated_VRMSE[start:end]) / (end - start)
                 self.log(f'val/VRMSE_{i}', rollout_loss_i, on_step=False, on_epoch=True, sync_dist=self.ddp)
 
             self.log('val/loss', loss, on_step=False, on_epoch=True, sync_dist=self.ddp)
@@ -457,7 +727,34 @@ class TrainModule(L.LightningModule):
             self.log('val/sRMSE_high', sum(sRMSE_high) / len(sRMSE_high), on_step=False, on_epoch=True, sync_dist=self.ddp)
             self.log('val/sRMSE_total', sum(sRMSE_total) / len(sRMSE_total), on_step=False, on_epoch=True, sync_dist=self.ddp)
 
-            if batch_idx == 0 or self.eval_all: # only plot first batch or if eval_all flag is set
+            self.log('val/CRPS', sum(accumulated_CRPS) / len(accumulated_CRPS),
+                     on_step=False, on_epoch=True, sync_dist=self.ddp)
+            self.log('val/SSR', sum(accumulated_SSR) / len(accumulated_SSR),
+                     on_step=False, on_epoch=True, sync_dist=self.ddp)
+            self.log('val/ensemble_size', float(ens), on_step=False, on_epoch=True, sync_dist=self.ddp)
+
+            # single-member metrics (ens > 1 only)
+            for key, curve in (('val/VRMSE_single', accumulated_VRMSE_single),
+                               ('val/sRMSE_low_single', sRMSE_low_single),
+                               ('val/sRMSE_mid_single', sRMSE_mid_single),
+                               ('val/sRMSE_high_single', sRMSE_high_single)):
+                if curve:
+                    self.log(key, sum(curve) / len(curve),
+                             on_step=False, on_epoch=True, sync_dist=self.ddp)
+
+            n_samples = u_label.shape[0]
+            for name, curve in (('loss', accumulated_loss),
+                                ('VRMSE', accumulated_VRMSE),
+                                ('CRPS', accumulated_CRPS),
+                                ('SSR', accumulated_SSR),
+                                ('VRMSE_single', accumulated_VRMSE_single),
+                                ('sRMSE_low', sRMSE_low),
+                                ('sRMSE_mid', sRMSE_mid),
+                                ('sRMSE_high', sRMSE_high),
+                                ('sRMSE_total', sRMSE_total)):
+                self._accumulate_curve(name, curve, n_samples, nt - 1)
+
+            if self.plot_val and (batch_idx == 0 or self.eval_all): # only plot first batch or if eval_all flag is set
                 if self.ddp and self.global_rank != 0:
                     pass
                 else:
@@ -467,25 +764,91 @@ class TrainModule(L.LightningModule):
                         u_label_denorm = u_label_denorm[:, :, 0] 
                         u_pred_denorm = u_pred_denorm[:, :, 0] 
 
-                    plot_result_2d(u_label_denorm, u_pred_denorm, n_t=10, path=f'{self.log_dir}batch_{batch_idx}_ep_{self.current_epoch}.png')
+                    plot_result_2d(u_label_denorm, u_pred_denorm, n_t=10, path=f'{self.log_dir}batch_{batch_idx}_step_{self.global_step}.png')
                     if self.pde == "km_flow":
-                        plot_entropy_2d(u_label_denorm, u_pred_denorm, n_t=5, path=f'{self.log_dir}batch_{batch_idx}_entropy_ep_{self.current_epoch}.png')
+                        plot_entropy_2d(u_label_denorm, u_pred_denorm, n_t=5, path=f'{self.log_dir}batch_{batch_idx}_entropy_step_{self.global_step}.png')
                     
-                    with open(f'{self.log_dir}accumulated_loss_batch_{batch_idx}_ep{self.current_epoch}.pkl', 'wb') as f:
+                    with open(f'{self.log_dir}accumulated_loss_batch_{batch_idx}_step{self.global_step}.pkl', 'wb') as f:
                         pickle.dump(accumulated_loss, f)
 
-                    with open(f'{self.log_dir}accumulated_VRMSE_batch_{batch_idx}_ep{self.current_epoch}.pkl', 'wb') as f:
+                    with open(f'{self.log_dir}accumulated_VRMSE_batch_{batch_idx}_step{self.global_step}.pkl', 'wb') as f:
                         pickle.dump(accumulated_VRMSE, f)
 
-                    with open(f'{self.log_dir}sRMSE_low_batch_{batch_idx}_ep{self.current_epoch}.pkl', 'wb') as f:
+                    with open(f'{self.log_dir}sRMSE_low_batch_{batch_idx}_step{self.global_step}.pkl', 'wb') as f:
                         pickle.dump(sRMSE_low, f)
 
-                    with open(f'{self.log_dir}sRMSE_mid_batch_{batch_idx}_ep{self.current_epoch}.pkl', 'wb') as f:
+                    with open(f'{self.log_dir}sRMSE_mid_batch_{batch_idx}_step{self.global_step}.pkl', 'wb') as f:
                         pickle.dump(sRMSE_mid, f)
 
-                    with open(f'{self.log_dir}sRMSE_high_batch_{batch_idx}_ep{self.current_epoch}.pkl', 'wb') as f:
+                    with open(f'{self.log_dir}sRMSE_high_batch_{batch_idx}_step{self.global_step}.pkl', 'wb') as f:
                         pickle.dump(sRMSE_high, f)
     
+    def _climate_lat_weight(self, nlat, nlon, like):
+        '''Cosine-latitude weights shaped to broadcast over a (..., nlat, nlon) field.'''
+        if self._lat_weight is None or self._lat_weight.shape[0] != nlat:
+            self._lat_weight = latitude_weight(nlat, nlon,
+                                               with_poles=self.config["data"]["with_poles"]).view(nlat, 1)
+        return self._lat_weight.to(device=like.device, dtype=like.dtype)
+
+    def on_validation_epoch_start(self):
+        self._val_curves = {}
+        self._val_curve_counts = {}
+
+    def _accumulate_curve(self, name, values, n_samples, length):
+        '''
+        Add one batch's metric-vs-lead-time curve to the running validation-set sum.
+        Curves are zero-padded to `length` with per-timestep sample counts.
+        '''
+        k = min(len(values), length)
+        if k == 0:
+            return
+        total = torch.zeros(length, dtype=torch.float64)
+        count = torch.zeros(length, dtype=torch.float64)
+        total[:k] = torch.as_tensor(values[:k], dtype=torch.float64) * n_samples
+        count[:k] = float(n_samples)
+        # drop non-finite steps
+        nonfinite = ~torch.isfinite(total)
+        total[nonfinite] = 0.0
+        count[nonfinite] = 0.0
+
+        for store, new in ((self._val_curves, total), (self._val_curve_counts, count)):
+            old = store.get(name)
+            store[name] = new if old is None or old.numel() != length else old + new
+
+    def on_validation_epoch_end(self):
+        '''
+        Write the validation-averaged metric-vs-lead-time curves to log_dir as .npz.
+        '''
+        # all ranks must agree before the all_gather collective
+        have_curves = torch.tensor(float(bool(self._val_curves)), device=self.device)
+        if self.ddp:
+            have_curves = self.all_gather(have_curves).min()
+        if not float(have_curves):
+            return
+
+        names = sorted(self._val_curves)
+        totals = torch.stack([self._val_curves[n] for n in names]).to(self.device)
+        counts = torch.stack([self._val_curve_counts[n] for n in names]).to(self.device)
+        if self.ddp:
+            totals = self.all_gather(totals).sum(0)
+            counts = self.all_gather(counts).sum(0)
+
+        self._val_curves = {}
+        self._val_curve_counts = {}
+
+        if self.ddp and self.global_rank != 0:
+            return
+
+        curves = (totals / counts.clamp(min=1.0)).cpu().numpy()
+        samples = counts.cpu().numpy()
+        tag = f"_{self.val_tag}" if self.val_tag else ""
+        os.makedirs(self.log_dir, exist_ok=True)
+        out = f"{self.log_dir}val_curves{tag}_step{self.global_step}.npz"
+        np.savez(out,
+                 **{n: curves[i] for i, n in enumerate(names)},
+                 **{f"n_samples_{n}": samples[i] for i, n in enumerate(names)})
+        print(f"Wrote validation curves vs lead time ({len(names)} metrics) to {out}")
+
     @torch.no_grad()
     def predict_climate(self, 
             surface_feat_traj,
@@ -521,7 +884,6 @@ class TrainModule(L.LightningModule):
 
         surface_target = surface_feat_traj[:, 1:] # b t nlat nlon c
         multilevel_target = multilevel_feat_traj[:, 1:] # b t nlat nlon nlevel c
-        b = surface_target.shape[0]
 
         surface_pred = torch.zeros_like(surface_target, device=surface_init.device) # b t nlat nlon c
         multilevel_pred = torch.zeros_like(multilevel_target, device=multilevel_init.device) # b t nlat nlon nlevel c
@@ -541,7 +903,7 @@ class TrainModule(L.LightningModule):
                 grid_params = grid_params.repeat_interleave(ensemble_size, dim=0) # ens*b nlat nlon (c + t*c)
 
             # make prediction
-            z_pred = self.forward(z_input, scalar_params=scalar_params, grid_params=grid_params) # b zlat zlon z
+            z_pred = self._timed_forward(z_input, scalar_params=scalar_params, grid_params=grid_params) # b zlat zlon z
             # decode the prediction
             model_pred = self.decode(z_pred) # b nlat nlon (c + nlevel*c)
             # rearrange prediction and save
@@ -565,13 +927,22 @@ class TrainModule(L.LightningModule):
                 pred_assembled = torch.cat([surface_pred, multilevel_pred_flattened], dim=-1) # b ens t nlat nlon (c + nlevel*c)
                 target_assembled = torch.cat([surface_target, multilevel_target_flattened], dim=-1) # b t nlat nlon (c + nlevel*c)
                 
-                return None, pred_assembled, target_assembled, z_pred
-            if b == 1:
-                surface_pred = surface_pred.mean(dim=0, keepdim=True) # ens t nlat nlon c -> 1 t nlat nlon c
-                multilevel_pred = multilevel_pred.mean(dim=0, keepdim=True) # ens t nlat nlon nlevel c -> 1 t nlat nlon nlevel c
-            else:
-                surface_pred = rearrange(surface_pred, '(b ens) t nlat nlon c -> b ens t nlat nlon c', ens=ensemble_size).mean(1) # b t nlat nlon c
-                multilevel_pred = rearrange(multilevel_pred, '(b ens) t nlat nlon nlevel c -> b ens t nlat nlon nlevel c', ens=ensemble_size).mean(1) # b t nlat nlon nlevel c
+                return None, pred_assembled, target_assembled, z_pred, None
+            surface_pred = rearrange(surface_pred, '(b ens) t nlat nlon c -> b ens t nlat nlon c', ens=ensemble_size)
+            multilevel_pred = rearrange(multilevel_pred, '(b ens) t nlat nlon nlevel c -> b ens t nlat nlon nlevel c', ens=ensemble_size)
+        else:
+            surface_pred = surface_pred.unsqueeze(1) # b 1 t nlat nlon c
+            multilevel_pred = multilevel_pred.unsqueeze(1) # b 1 t nlat nlon nlevel c
+
+        pred_ens_feat_dict = {}
+        for c, surface_feat_name in enumerate(surface_var_names):
+            pred_ens_feat_dict[surface_feat_name] = surface_pred[..., c] # b ens t nlat nlon
+        for c, multilevel_feat_name in enumerate(multilevel_var_names):
+            pred_ens_feat_dict[multilevel_feat_name] = multilevel_pred[..., c] # b ens t nlat nlon nlevel
+
+        # the deterministic metrics are scored on the ensemble mean
+        surface_pred = surface_pred.mean(1) # b t nlat nlon c
+        multilevel_pred = multilevel_pred.mean(1) # b t nlat nlon nlevel c
 
         pred_feat_dict = {}
         target_feat_dict = {}
@@ -591,17 +962,18 @@ class TrainModule(L.LightningModule):
         if not return_pred:
             return loss_dict
         else:
-            return loss_dict, pred_feat_dict, target_feat_dict, z_pred
+            return loss_dict, pred_feat_dict, target_feat_dict, z_pred, pred_ens_feat_dict
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        optimizer = build_optimizer(self.model, self.lr, self.modelconfig,
+                                    tag=f" {self.model_name}")
         if self.pde == "km_flow":
             step_size = 10
             gamma = 0.99
         else:
             step_size = 1
             gamma = 0.95
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+        scheduler = build_lr_scheduler(optimizer, self.config['training'], step_size, gamma)
 
         return [optimizer], [scheduler]
     

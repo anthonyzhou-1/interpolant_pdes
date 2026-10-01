@@ -35,8 +35,7 @@ CONSTANTS_FEATURES = [
     'z0', # surface_roughness_length
 ]
 
-# constant for each day, but repeat for each year
-# Also defined for leap years. Has an extra day, which is 4 more intervals
+# daily, repeated each year (leap years have 4 extra 6 h intervals)
 YEARLY_FEATURES = [
     'rsdt', # TOA (Top of Atmosphere) Incident Shortwave Radiation 
     'sic', # sea_ice_cover # nans
@@ -90,7 +89,6 @@ class Normalizer:
     def normalize(self, surface_feat, multilevel_feat):
         # surface feat in shape (nt, nlat, nlon, surface_channels)
         # multilevel feat in shape (nt, nlat, nlon, nlevel, multi_level_channels)
-        # assume this runs on cpu threads for dataloader
 
         for nan_idx in self.surface_nans:
             # replace nan w/ mean of the feature
@@ -202,7 +200,7 @@ class PLASIMData(Dataset):
         return self.surface_vars, self.multi_level_vars, self.constant_names, self.yearly_names
     
     def load_constants(self, boundary_path):
-        # load constants into local memory. About 300 Mb
+        # load constants into memory (~300 MB)
         boundary_file = h5f.File(boundary_path, 'r')
         constants_dict = {}
         for constant in self.constant_names:

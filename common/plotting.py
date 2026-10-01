@@ -66,11 +66,13 @@ def plot_result_2d(u, rec=None, n_t=5, path=None, cmap="twilight_shifted"):
     vmin = torch.min(u)
     vmax = torch.max(u)
 
+    n_t = min(n_t, u.shape[0])
+
     if n_t == 1:
         u_downs = u # (1, nx, ny)
         n_skip = 1
     else:
-        n_skip = u.shape[0] // n_t 
+        n_skip = u.shape[0] // n_t
         u_downs = u[::n_skip]
 
     if rec is not None:
@@ -128,11 +130,13 @@ def plot_entropy_2d(u, rec=None, n_t=5, path=None):
     u = u[0, ..., 0].detach().cpu() # (nt nx ny)
     rec = rec[0, ..., 0].detach().cpu() if rec is not None else None
 
+    n_t = min(n_t, u.shape[0])
+
     if n_t == 1:
         u_downs = u # (1, nx, ny)
         n_skip = 1
     else:
-        n_skip = u.shape[0] // n_t 
+        n_skip = u.shape[0] // n_t
         u_downs = u[::n_skip]
 
     if rec is not None:

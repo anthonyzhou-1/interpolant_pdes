@@ -13,13 +13,18 @@ class PDEDataset2D(Dataset):
                  resolution: list=None,
                  normalizer =  None,
                  return_traj = False,
-                 horizon = None) -> None:
+                 horizon = None,
+                 dt_stride: int = None) -> None:
         """Initialize the dataset object
         Args:
             path: path to dataset
             pde: string of PDE 
             split: [train, valid]
             resolution: resolution of the dataset [nt, nx, ny]
+            dt_stride: prediction lead time in raw timesteps. None derives it from
+                resolution (raw nt // nt, i.e. 2 for km_flow's 201 raw frames at nt=100).
+                The rollout keeps the same physical span, so a larger stride means fewer
+                rollout steps (km_flow: 100 / 51 / 26 frames at stride 2 / 4 / 8).
         Returns:
             None
         """
@@ -39,7 +44,7 @@ class PDEDataset2D(Dataset):
         self.t = torch.tensor(np.array(data['t'])) # (nt,)
 
         nt_data = self.t.shape[0] # original nt
-        self.t_downsample = int(nt_data / self.nt)  # downsample factor 
+        self.t_downsample = int(dt_stride) if dt_stride is not None else int(nt_data / self.nt)  # downsample factor
 
         self.t = self.t[::self.t_downsample] # downsample time 
         self.t = self.t - self.t[0] # start time from zero

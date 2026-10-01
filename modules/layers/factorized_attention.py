@@ -335,7 +335,6 @@ class FADiTBlockS2(nn.Module):
         u_skip = u
 
         u = modulate_fused(self.norm1(u), shift_msa, scale_msa)
-        # print(u.shape)
         # when pooling to x, account for the latitude weight
         lat_weights = torch.cos(lat)
         lat_weights = lat_weights / lat_weights.mean()      # normalize
@@ -514,9 +513,6 @@ class FADiTBlock3D(FABlock3D):
                 ):
         # u in shape: [b nz ny nx c]
         # scalar_cond in shape: [b 1 c]
-        # nz， ny, nx = u.shape[1], u.shape[2]
-        # print(u.shape)
-        # print(scalar_cond.shape)
         # u in shape: [b nz ny nx c]
         rotary_cos_z, rotary_sin_z = rotary_cos_sin_z
         rotary_cos_y, rotary_sin_y = rotary_cos_sin_y
