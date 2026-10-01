@@ -40,13 +40,6 @@ share a training objective and differ only at sampling, so one checkpoint serves
 
 Useful options (also settable in the config):
 
-| flag | meaning |
-|:-|:-|
-| `--optimizer` | `muon` (default; AdamW for non-matrix params) or `adam` |
-| `--ema_decay` | EMA of the weights used for validation and checkpoints (default `0.999`) |
-| `--max_steps`, `--val_every_n_steps`, `--save_every_n_train_steps`, `--archive_every_n_train_steps` | step-based schedule and checkpointing |
-| `--dt_stride` | lead time in raw timesteps (Kolmogorov / Rayleigh-Benard) |
-
 ## Evaluation
 Validation metrics on a checkpoint:
 ```
